@@ -1,0 +1,28 @@
+Third-Party Data & Model Attributions
+=====================================
+
+1. Camoufox Fingerprint Catalogs, Presets, and Property Definitions
+   - Files:
+     - fonts.json
+     - essential-fonts.json
+     - font-bases.json
+     - font-groups.json
+     - voice-manifests.json
+     - voice-uris.json
+     - media-devices.json
+     - fingerprint-presets.json
+     - fingerprint-presets-v150.json
+     - fpgen-model.json
+     - properties.json
+   - Source: https://github.com/daijro/camoufox
+   - Copyright (c) 2024-2026 daijro and the Camoufox contributors
+   - License: MIT License (see LICENSE-CAMOUFOX)
+
+2. Fingerprint Generator (fpgen) Bayesian Network Model Data (model-2/2026)
+   - Files:
+     - fingerprint-network.json.zst
+     - values.json.zst
+     - values.dat.zst
+   - Source: https://github.com/scrapfly/fingerprint-generator
+   - Created by daijro; data provided by Scrapfly
+   - License: Apache License, Version 2.0 (see LICENSE-FPGEN)

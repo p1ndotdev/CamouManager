@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">CamouManager</title>
+  <desc id="desc">An orange fox wearing dark sunglasses, with blue reflections and a yellow forehead highlight.</desc>
+  <g stroke="#074784" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path fill="#ee8424" d="M106 210 76 70q-3-16 13-8l118 79h98l118-79q16-8 13 8l-30 140 26 83q9 26-13 48L286 452q-30 25-60 0L93 341q-22-22-13-48Z"/>
+    <path fill="#d65126" stroke="none" d="m106 184-17-96 92 64Zm300 0 17-96-92 64Z"/>
+    <path fill="#ffe513" stroke="none" d="m215 147 41 63 41-63-41 13Z"/>
+    <path fill="#d65126" stroke="none" d="m86 292 41-37 129 107 129-107 41 37-31 46-109 108q-30 25-60 0L117 338Z"/>
+    <path fill="#fff4dc" stroke="none" d="m93 302 79 19 84 42 84-42 79-19-57 71-76 70q-30 25-60 0l-76-70Z"/>
+    <path fill="#ee8424" stroke="none" d="m256 305 48 76-48 43-48-43Z"/>
+    <path fill="#101820" stroke="none" d="M225 366q31-11 62 0l-17 24q-14 13-28 0Z"/>
+    <path fill="none" d="m105 215 22 15m258 0 22-15"/>
+    <path fill="#101820" d="m120 209 112 7-6 49q-3 28-32 30l-32-2q-28-2-33-29Zm160 7 112-7-9 55q-5 27-33 29l-32 2q-29-2-32-30Z"/>
+    <path fill="none" d="M233 233q23-16 46 0"/>
+    <path fill="#58beec" stroke="none" d="m139 229 44 3-35 40q-8-6-9-19Zm160 2 42-3-34 43q-7-6-8-21Z"/>
+    <path fill="#ffffff" stroke="none" opacity=".6" d="m190 233 15 1-27 35-15-1Zm159-5 15-1-30 39-15 1Z"/>
+  </g>
+</svg>

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CamouManager",
+  "version": "1.0.0",
+  "identifier": "com.camoumanager.rust",
+  "mainBinaryName": "CamouManager",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist/frontend"
+  },
+  "app": {
+    "windows": [{
+      "label": "main",
+      "title": "CamouManager - Quản lý trình duyệt Camoufox",
+      "width": 1250,
+      "height": 780,
+      "minWidth": 900,
+      "minHeight": 620
+    }],
+    "security": {
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "license": "GPL-3.0-only",
+    "targets": ["nsis"],
+    "icon": ["icons/camoumanager.ico", "icons/camoumanager.png"],
+    "resources": [
+      "../LICENSE",
+      "data/NOTICE",
+      "data/LICENSE-CAMOUFOX",
+      "data/LICENSE-FPGEN"
+    ],
+    "windows": {
+      "webviewInstallMode": { "type": "downloadBootstrapper", "silent": true },
+      "nsis": {
+        "installMode": "currentUser",
+        "displayLanguageSelector": false,
+        "languages": ["English"],
+        "installerHooks": "installer-hooks.nsh"
+      }
+    }
+  }
+}

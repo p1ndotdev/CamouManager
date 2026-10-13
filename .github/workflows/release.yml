@@ -1,0 +1,85 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Validate release version
+        id: version
+        run: |
+          $Version = (Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json).version
+          $PackageVersion = (Get-Content 'package.json' -Raw | ConvertFrom-Json).version
+          $Cargo = Get-Content 'src-tauri/Cargo.toml' -Raw
+          $CargoVersion = [regex]::Match($Cargo, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if ($Version -ne $PackageVersion -or $Version -ne $CargoVersion) {
+            throw 'Versions in package.json, Cargo.toml and tauri.conf.json must match.'
+          }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$Version") {
+            throw "Release tag must be v$Version."
+          }
+          "version=$Version" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Rust stable MSVC
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain setup failed.' }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain selection failed.' }
+
+      - name: Build installer and portable
+        run: ./tools/build.ps1
+
+      - name: Package release assets
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $Version = $env:RELEASE_VERSION
+          Compress-Archive -Path 'dist/CamouManager' -DestinationPath "dist/CamouManager-Portable-$Version.zip" -Force
+          Get-FileHash "dist/CamouManager-Setup-$Version.exe", "dist/CamouManager-Portable-$Version.zip" -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLowerInvariant())  $(Split-Path $_.Path -Leaf)" } |
+            Set-Content 'dist/SHA256SUMS.txt' -Encoding ascii
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CamouManager-${{ steps.version.outputs.version }}-windows-x64
+          path: |
+            dist/CamouManager-Setup-${{ steps.version.outputs.version }}.exe
+            dist/CamouManager-Portable-${{ steps.version.outputs.version }}.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $Version = $env:RELEASE_VERSION
+          $Source = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/tree/$env:GITHUB_SHA"
+          gh release create $env:GITHUB_REF_NAME "dist/CamouManager-Setup-$Version.exe" "dist/CamouManager-Portable-$Version.zip" 'dist/SHA256SUMS.txt' --verify-tag --title "CamouManager $Version" --generate-notes --notes "Windows x64 installer and portable. Source and build instructions: $Source"
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed.' }

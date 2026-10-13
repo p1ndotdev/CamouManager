@@ -52,6 +52,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/build.ps1
 
 Script tạo lại `dist/CamouManager`; không để dữ liệu cá nhân trong thư mục này.
 
+### Release trên GitHub
+
+Workflow `.github/workflows/release.yml` build **Windows x64** bằng script ở trên. Push tag `v*` sẽ tự tạo GitHub Release với installer `.exe`, portable `.zip` (kèm license) và `SHA256SUMS.txt`; không cần tạo token riêng, workflow dùng `GITHUB_TOKEN` với quyền `contents: write`.
+
+Trước mỗi release, cập nhật cùng version trong `package.json`, `package-lock.json`, `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` và bản ghi `camoumanager` trong `src-tauri/Cargo.lock`. Dùng `npm install --package-lock-only` và `cargo check --manifest-path src-tauri/Cargo.toml` để cập nhật lockfile sau khi sửa version. Tag phải đúng `v<version>`; lệch version sẽ dừng trước khi build.
+
+Ví dụ phát hành version hiện tại, sau khi commit và push mã nguồn cùng workflow:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Để chỉ build thử, vào **Actions → Windows release → Run workflow** trên branch cần build. Tải kết quả ở **Artifacts** của lần chạy; artifact được giữ 7 ngày, không tạo Release khi chạy thủ công. Workflow phải có trên default branch để nút chạy thủ công xuất hiện. Mỗi bản phát hành dùng một tag mới; bước tạo Release sẽ báo lỗi nếu Release cho tag đó đã tồn tại.
+
+Repo **public** dùng runner tiêu chuẩn `windows-2022` được miễn phí phút chạy theo [chính sách GitHub Actions](https://docs.github.com/en/billing/concepts/product-billing/github-actions). Không phải tài nguyên vô hạn: GitHub vẫn có [giới hạn thời gian, số job đồng thời và lưu trữ](https://docs.github.com/en/actions/reference/limits); larger runners vẫn tính phí. Bản dựng chưa ký số, Windows có thể cảnh báo SmartScreen.
+
 ## Dữ liệu & lưu ý
 
 - Dữ liệu nằm tại `%LOCALAPPDATA%\CamouManagerRust`; có thể chọn thư mục khác bằng `CAMOUMANAGER_HOME`.

@@ -51,6 +51,16 @@ impl IpSync {
             fs::write(path, contents)?;
         }
         reject_link(&state_tmp)?;
+        // Session-specific addon settings must not reuse Gecko's cached extension startup data.
+        let browser_dir = profile_dir.join("browser");
+        let cache_dir = browser_dir.join("startupCache");
+        let cache_path = cache_dir.join("webext.sc.lz4");
+        for path in [&browser_dir, &cache_dir, &cache_path] { reject_link(path)?; }
+        match fs::remove_file(&cache_path) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error.into()),
+        }
         Ok(Self { addon_dir, state_path, token, sequence: 0, last_progress: Instant::now() })
     }
 
@@ -96,6 +106,27 @@ pub(crate) fn update_profile_ip(profile: &mut Value, ip: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preparation_invalidates_extension_cache_without_deleting_browser_data() {
+        let home = tempfile::tempdir().unwrap();
+        let browser = home.path().join("browser");
+        let cache = browser.join("startupCache");
+        fs::create_dir_all(&cache).unwrap();
+        let cached_extensions = cache.join("webext.sc.lz4");
+        let preserved = [browser.join("cookies.sqlite"), browser.join("sessionstore.jsonlz4"), cache.join("startupCache.8.little")];
+        for path in &preserved { fs::write(path, b"existing data").unwrap(); }
+        for _ in 0..2 {
+            fs::write(&cached_extensions, b"stale extension startup data").unwrap();
+            IpSync::prepare(home.path(), "https://api.ipify.org?format=json", &Value::Null).unwrap();
+            assert!(!cached_extensions.exists());
+            for path in &preserved { assert_eq!(fs::read(path).unwrap(), b"existing data"); }
+        }
+        IpSync::prepare(home.path(), "https://api.ipify.org?format=json", &Value::Null).unwrap();
+        fs::create_dir(&cached_extensions).unwrap();
+        assert!(IpSync::prepare(home.path(), "https://api.ipify.org?format=json", &Value::Null).is_err());
+        assert!(cached_extensions.is_dir());
+    }
 
 
     #[test]

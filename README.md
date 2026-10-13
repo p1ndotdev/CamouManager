@@ -20,9 +20,9 @@ Yêu cầu **Windows 10/11 x64** và **Microsoft Edge WebView2 Runtime**.
 
 Đổi Tiếng Việt / English tại **Cài đặt → Ngôn ngữ giao diện**. Lựa chọn được ghi nhớ, không thay đổi locale của fingerprint. Log và chi tiết lỗi kỹ thuật giữ nguyên ngôn ngữ gốc.
 
-### Cập nhật lên v1.0.1
+### Cập nhật lên v1.0.2
 
-Bản này sửa lỗi khởi động phiên native khi SOCKS5 remote DNS làm Camoufox công bố BiDi bằng `localhost`. Không đổi schema, thư mục dữ liệu hoặc fingerprint đã lưu.
+Bản v1.0.2 sửa lỗi đồng bộ IP timeout khi mở lại profile dùng proxy: trước mỗi phiên, app làm mới riêng `browser/startupCache/webext.sc.lz4` để tiện ích monitor nạp cấu hình phiên hiện tại. Không xóa cookie, phiên đăng nhập hay cache khác; không đổi schema, thư mục dữ liệu hoặc fingerprint đã lưu. Bản v1.0.1 trước đó sửa lỗi phiên native khi SOCKS5 remote DNS làm Camoufox công bố BiDi bằng `localhost`.
 
 Dừng các profile và đóng app trước khi cập nhật; nên tạo backup và lưu ra thư mục ngoài dữ liệu app trước. Cài setup mới đè lên bản cũ, hoặc giải nén portable mới và chạy `CamouManager.exe`. Dữ liệu vẫn ở `%LOCALAPPDATA%\CamouManagerRust`, không nằm cạnh executable. Nếu dùng `CAMOUMANAGER_HOME`, giữ nguyên biến này để mở đúng dữ liệu cũ.
 
@@ -71,8 +71,8 @@ Trước mỗi release, cập nhật cùng version trong `package.json`, `packag
 Ví dụ phát hành version hiện tại, sau khi commit và push mã nguồn cùng workflow:
 
 ```powershell
-git tag v1.0.1
-git push origin v1.0.1
+git tag v1.0.2
+git push origin v1.0.2
 ```
 
 Để chỉ build thử, vào **Actions → Windows release → Run workflow** trên branch cần build. Tải kết quả ở **Artifacts** của lần chạy; artifact được giữ 7 ngày, không tạo Release khi chạy thủ công. Workflow phải có trên default branch để nút chạy thủ công xuất hiện. Mỗi bản phát hành dùng một tag mới; bước tạo Release sẽ báo lỗi nếu Release cho tag đó đã tồn tại.

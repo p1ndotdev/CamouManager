@@ -9,15 +9,27 @@ pub(crate) struct BrowserSession {
 }
 
 impl BrowserSession {
-    pub(crate) fn connect(port: u16, owned_pids: &[u32]) -> Result<Self> {
-        let address = SocketAddr::from(([127,0,0,1],port));
+    pub(crate) fn endpoint(line: &str) -> Option<url::Url> {
+        let endpoint = url::Url::parse(line.strip_prefix("WebDriver BiDi listening on ")?).ok()?;
+        (endpoint.scheme() == "ws"
+            && matches!(endpoint.host_str(), Some("127.0.0.1" | "localhost"))
+            && endpoint.path() == "/"
+            && endpoint.port().is_some()
+            && endpoint.username().is_empty()
+            && endpoint.password().is_none()
+            && endpoint.query().is_none()
+            && endpoint.fragment().is_none())
+            .then_some(endpoint)
+    }
+    pub(crate) fn connect(endpoint: &url::Url, owned_pids: &[u32]) -> Result<Self> {
+        let address = SocketAddr::from(([127,0,0,1],endpoint.port().context("Thiếu cổng phiên native")?));
         let stream = TcpStream::connect_timeout(&address,Duration::from_secs(2))?;
         stream.set_read_timeout(Some(Duration::from_secs(2)))?;
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(64 * 1024);
         config.max_frame_size = Some(64 * 1024);
-        let (socket, _) = client_with_config(format!("ws://127.0.0.1:{port}/session"),stream,Some(config))
+        let (socket, _) = client_with_config(endpoint.join("session")?.as_str(),stream,Some(config))
             .map_err(|error| anyhow!("Không kết nối được phiên trình duyệt native: {error}"))?;
         let mut session = Self { socket, next_id:0 };
         let result = session.call("session.new",json!({"capabilities":{}}))?;
@@ -83,6 +95,18 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    fn endpoint_accepts_loopback_hosts_and_rejects_remote_or_decorated_urls() {
+        for host in ["127.0.0.1", "localhost"] {
+            let endpoint = BrowserSession::endpoint(&format!("WebDriver BiDi listening on ws://{host}:9222")).unwrap();
+            assert_eq!(endpoint.host_str(), Some(host));
+            assert_eq!(endpoint.join("session").unwrap().as_str(), format!("ws://{host}:9222/session"));
+        }
+        for address in ["ws://example.com:9222", "ws://127.0.0.2:9222", "wss://localhost:9222", "ws://localhost", "ws://localhost:9222/session", "ws://user@localhost:9222", "ws://localhost:9222/?x=1", "ws://localhost:9222/#x"] {
+            assert!(BrowserSession::endpoint(&format!("WebDriver BiDi listening on {address}")).is_none(), "{address}");
+        }
+    }
+
+    #[test]
     fn rejects_unowned_browser_without_closing_it() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -97,7 +121,8 @@ mod tests {
             assert_eq!(request["method"],"session.end");
             socket.send(Message::Text(json!({"type":"success","id":request["id"],"result":{}}).to_string().into())).unwrap();
         });
-        let error = BrowserSession::connect(port,&[123]).err().expect("Unowned process must be rejected");
+        let endpoint = BrowserSession::endpoint(&format!("WebDriver BiDi listening on ws://127.0.0.1:{port}")).unwrap();
+        let error = BrowserSession::connect(&endpoint,&[123]).err().expect("Unowned process must be rejected");
         assert!(error.to_string().contains("không thuộc tiến trình"));
         server.join().unwrap();
     }

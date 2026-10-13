@@ -20,6 +20,14 @@ Yêu cầu **Windows 10/11 x64** và **Microsoft Edge WebView2 Runtime**.
 
 Đổi Tiếng Việt / English tại **Cài đặt → Ngôn ngữ giao diện**. Lựa chọn được ghi nhớ, không thay đổi locale của fingerprint. Log và chi tiết lỗi kỹ thuật giữ nguyên ngôn ngữ gốc.
 
+### Cập nhật lên v1.0.1
+
+Bản này sửa lỗi khởi động phiên native khi SOCKS5 remote DNS làm Camoufox công bố BiDi bằng `localhost`. Không đổi schema, thư mục dữ liệu hoặc fingerprint đã lưu.
+
+Dừng các profile và đóng app trước khi cập nhật; nên tạo backup và lưu ra thư mục ngoài dữ liệu app trước. Cài setup mới đè lên bản cũ, hoặc giải nén portable mới và chạy `CamouManager.exe`. Dữ liệu vẫn ở `%LOCALAPPDATA%\CamouManagerRust`, không nằm cạnh executable. Nếu dùng `CAMOUMANAGER_HOME`, giữ nguyên biến này để mở đúng dữ liệu cũ.
+
+Không cần gỡ bản cũ trước. Nếu setup hỏi cách xử lý bản cũ, chọn **Do not uninstall**. Nếu chọn **Uninstall before installing**, trình gỡ bản cũ có thể hiện checkbox **Delete the application data**: phải bỏ chọn để giữ dữ liệu. Chọn xóa dữ liệu khi gỡ cài đặt sẽ xóa toàn bộ dữ liệu mặc định, kể cả backup nằm trong đó. Không xóa thư mục dữ liệu hoặc đặt nó bên trong thư mục cài đặt/portable.
+
 ## Phát triển
 
 Cần Node.js 22.12+ hoặc 24 LTS, Rust stable MSVC và Visual Studio Build Tools với **Desktop development with C++ / Windows SDK**.
@@ -43,6 +51,8 @@ $env:CAMOUFOX_SMOKE_EXE = Join-Path $env:LOCALAPPDATA 'CamouManagerRust\versions
 cargo test --release --manifest-path src-tauri/Cargo.toml --all-targets -- --include-ignored --nocapture --test-threads=1
 ```
 
+Smoke `smoke_real_browser_socks_localhost_bidi` kiểm tra BiDi khi SOCKS5 dùng remote DNS, cả chế độ headless và có cửa sổ. Camoufox có thể công bố `localhost` thay vì `127.0.0.1`; app giữ hostname này khi bắt tay WebSocket, chỉ kết nối loopback và xác minh PID thuộc profile.
+
 
 Đóng gói installer và portable vào `dist/`:
 
@@ -61,8 +71,8 @@ Trước mỗi release, cập nhật cùng version trong `package.json`, `packag
 Ví dụ phát hành version hiện tại, sau khi commit và push mã nguồn cùng workflow:
 
 ```powershell
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.0.1
+git push origin v1.0.1
 ```
 
 Để chỉ build thử, vào **Actions → Windows release → Run workflow** trên branch cần build. Tải kết quả ở **Artifacts** của lần chạy; artifact được giữ 7 ngày, không tạo Release khi chạy thủ công. Workflow phải có trên default branch để nút chạy thủ công xuất hiện. Mỗi bản phát hành dùng một tag mới; bước tạo Release sẽ báo lỗi nếu Release cho tag đó đã tồn tại.

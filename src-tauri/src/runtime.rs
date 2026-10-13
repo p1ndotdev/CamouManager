@@ -1697,10 +1697,10 @@ impl Runtime {
             };
 
             let stderr_tail = Arc::new(Mutex::new(String::new()));
-            let debug_port = Arc::new(Mutex::new(None));
+            let debug_endpoint = Arc::new(Mutex::new(None));
             if let Some(stderr) = child.stderr.take() {
                 let tail_clone = Arc::clone(&stderr_tail);
-                let debug_port = Arc::clone(&debug_port);
+                let debug_endpoint = Arc::clone(&debug_endpoint);
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stderr);
                     let mut line = String::new();
@@ -1710,12 +1710,8 @@ impl Runtime {
                             Ok(0) | Err(_) => break,
                             Ok(_) => {
                                 let trimmed = line.trim();
-                                if let Some(endpoint) = trimmed.strip_prefix("WebDriver BiDi listening on ") {
-                                    if let Ok(endpoint) = url::Url::parse(endpoint) {
-                                        if endpoint.scheme() == "ws" && endpoint.host_str() == Some("127.0.0.1") && endpoint.path() == "/" {
-                                            *debug_port.lock() = endpoint.port();
-                                        }
-                                    }
+                                if let Some(endpoint) = BrowserSession::endpoint(trimmed) {
+                                    *debug_endpoint.lock() = Some(endpoint);
                                 }
                                 if !trimmed.is_empty() {
                                     let mut guard = tail_clone.lock();
@@ -1815,9 +1811,9 @@ impl Runtime {
                         owned
                     };
 
-                    let port = *debug_port.lock();
-                    if let Some(port) = port {
-                        let driver = BrowserSession::connect(port, &owned)?;
+                    let endpoint = debug_endpoint.lock().take();
+                    if let Some(endpoint) = endpoint {
+                        let driver = BrowserSession::connect(&endpoint, &owned)?;
                         let mut sessions = self.sessions.lock();
                         let Some(session) = sessions.get_mut(id) else {
                             bail!("Profile session not found");
@@ -2424,6 +2420,52 @@ mod tests {
         assert_eq!(installed.len(), 2);
         assert_eq!(string(&installed[0], "id"), "v156.0.1");
         assert_eq!(string(&installed[1], "id"), "v156.0.1-beta.37");
+    }
+
+    #[test]
+    #[ignore]
+    #[cfg(windows)]
+    fn smoke_real_browser_socks_localhost_bidi() {
+        let exe = PathBuf::from(std::env::var_os("CAMOUFOX_SMOKE_EXE").expect("CAMOUFOX_SMOKE_EXE required"));
+        // Remote SOCKS DNS makes Gecko advertise localhost rather than 127.0.0.1.
+        for headless in [true, false] {
+            let home = tempfile::tempdir().unwrap();
+            fs::write(home.path().join("user.js"), concat!(
+                "user_pref(\"network.proxy.type\", 1);\n",
+                "user_pref(\"network.proxy.socks\", \"127.0.0.1\");\n",
+                "user_pref(\"network.proxy.socks_port\", 9);\n",
+                "user_pref(\"network.proxy.socks_version\", 5);\n",
+                "user_pref(\"network.proxy.socks_remote_dns\", true);\n",
+                "user_pref(\"network.proxy.no_proxies_on\", \"\");\n",
+            )).unwrap();
+            let mut cmd = Command::new(&exe);
+            cmd.arg("-no-remote").arg("--remote-debugging-port=0").arg("-wait-for-browser")
+                .arg("-profile").arg(home.path()).arg("about:blank")
+                .stdout(Stdio::null()).stderr(Stdio::piped());
+            if headless { cmd.arg("-headless"); }
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+            let mut child = cmd.spawn().unwrap();
+            let job = ProcessJob::attach(child.id()).unwrap();
+            let stderr = child.stderr.take().unwrap();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if let Some(endpoint) = BrowserSession::endpoint(&line) {
+                        let _ = tx.send(endpoint);
+                    }
+                }
+            });
+            let endpoint = rx.recv_timeout(Duration::from_secs(15)).expect("Missing SOCKS BiDi endpoint");
+            assert_eq!(endpoint.host_str(), Some("localhost"));
+            let mut driver = BrowserSession::connect(&endpoint, &job.pids()).unwrap();
+            driver.navigate_for_test("about:blank").unwrap();
+            assert_eq!(driver.evaluate_json("JSON.stringify(location.href)").unwrap(), json!("about:blank"));
+            driver.close().unwrap();
+            child.wait().unwrap();
+            reader.join().unwrap();
+            eprintln!("SOCKS localhost BiDi: headless={headless}, session.new + page evaluation + browser.close passed");
+        }
     }
 
     /// Isolated temporary-home smoke scenario for real Camoufox binary execution (run by parent via `--ignored`).

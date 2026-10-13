@@ -45,25 +45,37 @@ impl BrowserSession {
         self.next_id += 1;
         let id = self.next_id;
         self.socket.send(Message::Text(serde_json::to_string(&json!({"id":id,"method":method,"params":params}))?.into()))?;
-        let timeout = Duration::from_secs(3);
-        #[cfg(test)]
-        let timeout = self.socket.get_ref().read_timeout()?.unwrap_or(timeout).max(timeout);
+        let read_timeout = self.socket.get_ref().read_timeout()?;
+        let timeout = read_timeout.unwrap_or(Duration::from_secs(3)).max(Duration::from_secs(3));
         let deadline = Instant::now() + timeout;
-        for _ in 0..32 {
-            if Instant::now() >= deadline { bail!("Phiên native không phản hồi: {method}"); }
-            match self.socket.read()? {
-                Message::Text(text) => {
-                    let mut frame: Value = serde_json::from_str(&text)?;
-                    if frame["id"].as_u64() != Some(id) { continue; }
-                    if frame["type"] == "error" { bail!("Lỗi phiên native: {}",frame["message"]); }
-                    return Ok(frame["result"].take());
-                },
-                Message::Close(_) => bail!("Phiên trình duyệt đã đóng trước khi hoàn tất {method}"),
-                Message::Ping(_) | Message::Pong(_) => {},
-                _ => bail!("Dữ liệu phiên native không hợp lệ"),
+        let result = (|| {
+            for _ in 0..32 {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() { bail!("Phiên native không phản hồi: {method}"); }
+                self.socket.get_ref().set_read_timeout(Some(read_timeout.unwrap_or(timeout).min(remaining)))?;
+                match self.socket.read()? {
+                    Message::Text(text) => {
+                        let mut frame: Value = serde_json::from_str(&text)?;
+                        if frame["id"].as_u64() != Some(id) { continue; }
+                        if frame["type"] == "error" { bail!("Lỗi phiên native: {}",frame["message"]); }
+                        return Ok(frame["result"].take());
+                    },
+                    Message::Close(_) => bail!("Phiên trình duyệt đã đóng trước khi hoàn tất {method}"),
+                    Message::Ping(_) | Message::Pong(_) => {},
+                    _ => bail!("Dữ liệu phiên native không hợp lệ"),
+                }
             }
-        }
-        bail!("Phiên native trả quá nhiều thông báo không liên quan")
+            bail!("Phiên native trả quá nhiều thông báo không liên quan")
+        })();
+        self.socket.get_ref().set_read_timeout(read_timeout)?;
+        result
+    }
+    pub(crate) fn install_extension(&mut self, path: &str) -> Result<()> {
+        let read_timeout = self.socket.get_ref().read_timeout()?;
+        self.socket.get_ref().set_read_timeout(Some(Duration::from_secs(20)))?;
+        let result = self.call("webExtension.install", json!({"extensionData": {"type": "path", "path": path}}));
+        self.socket.get_ref().set_read_timeout(read_timeout)?;
+        result.map(|_| ())
     }
     pub(crate) fn close(mut self) -> Result<()> { self.call("browser.close",json!({})).map(|_| ()) }
     #[cfg(test)]

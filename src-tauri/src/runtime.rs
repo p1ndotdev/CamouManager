@@ -1542,7 +1542,6 @@ impl Runtime {
             addon_paths.push(browser_path_string(&bm_addon_dir));
             let ip_sync = if browser_proxy.is_some() {
                 let sync = IpSync::prepare(&profile_dir, self.network.egress_url(), &browser_proxy.as_ref().unwrap().prefs)?;
-                addon_paths.push(browser_path_string(&sync.addon_dir));
                 Some(sync)
             } else { None };
             // 7. Build and validate Camoufox config + startup preferences
@@ -1813,7 +1812,14 @@ impl Runtime {
 
                     let endpoint = debug_endpoint.lock().take();
                     if let Some(endpoint) = endpoint {
-                        let driver = BrowserSession::connect(&endpoint, &owned)?;
+                        let mut driver = BrowserSession::connect(&endpoint, &owned)?;
+                        // Await monitor installation instead of Camoufox's fire-and-forget addon bootstrap.
+                        let monitor_path = self.sessions.lock().get(id)
+                            .and_then(|session| session.ip_sync.as_ref())
+                            .map(|sync| browser_path_string(&sync.addon_dir));
+                        if let Some(path) = monitor_path {
+                            driver.install_extension(&path).context("Không cài được tiện ích đồng bộ IP")?;
+                        }
                         let mut sessions = self.sessions.lock();
                         let Some(session) = sessions.get_mut(id) else {
                             bail!("Profile session not found");
@@ -2779,6 +2785,13 @@ mod tests {
         assert!(cookie.as_str().unwrap().contains("privacy_session=persisted"), "{cookie}");
         runtime.stop(id).unwrap();
         println!("PASS session cookie survives live IP changes and monitor recovery");
+        assert_eq!(runtime.launch(id, true).unwrap()["state"], "running");
+        assert_eq!(runtime.status().unwrap()[id]["egress_ip"], "203.0.113.14");
+        runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().navigate_for_test("http://egress.invalid/probe").unwrap();
+        let cookie = runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().evaluate_json("JSON.stringify(document.cookie)").unwrap();
+        assert!(cookie.as_str().unwrap().contains("privacy_session=persisted"), "Cookie lost on monitor reinstall: {cookie}");
+        runtime.stop(id).unwrap();
+        println!("PASS monitor reinstall confirms current session IP and preserves cookies");
         profiles.update(id, json!({"proxy_id": "", "startup_urls": ["about:blank"]})).unwrap();
         runtime.launch(id, true).unwrap();
         let navigation = runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().navigate_for_test("about:blank");

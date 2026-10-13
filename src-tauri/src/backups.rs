@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::{
-    files::{copy_tree, extract_zip, reject_link},
+    files::{extract_zip, reject_link},
     runtime::Runtime,
     store::{new_id, safe_component, string, utcnow, Store},
 };
@@ -37,7 +37,74 @@ const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
 const MAX_MANIFEST_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
 const MAX_SINGLE_FILE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
 const MAX_TOTAL_UNCOMPRESSED: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
+const MAX_ENTRIES: usize = 100_000;
+const MAX_METADATA_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB consistent IPC bound
 
+#[derive(Clone, Copy, Debug)]
+struct ArchiveLimits {
+    max_single_file: u64,
+    max_total_uncompressed: u64,
+    max_entries: usize,
+    max_manifest_size: u64,
+    max_metadata_size: u64,
+}
+
+impl Default for ArchiveLimits {
+    fn default() -> Self {
+        Self {
+            max_single_file: MAX_SINGLE_FILE,
+            max_total_uncompressed: MAX_TOTAL_UNCOMPRESSED,
+            max_entries: MAX_ENTRIES,
+            max_manifest_size: MAX_MANIFEST_SIZE,
+            max_metadata_size: MAX_METADATA_SIZE,
+        }
+    }
+}
+
+
+pub(crate) fn cleanup_legacy_residues(root: &Path) -> Result<()> {
+    cleanup_legacy_residues_in_dir(root)?;
+    let backups_dir = root.join("backups");
+    if backups_dir.is_dir() {
+        cleanup_legacy_residues_in_dir(&backups_dir)?;
+    }
+    Ok(())
+}
+
+fn is_legacy_residue_filename(name: &str) -> bool {
+    let stripped = if let Some(s) = name.strip_prefix("._backup_zip_") {
+        s
+    } else if let Some(s) = name.strip_prefix("_backup_zip_") {
+        s
+    } else if let Some(s) = name.strip_prefix("_decrypted_zip_") {
+        s
+    } else {
+        return false;
+    };
+    stripped.strip_suffix(".tmp").is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn cleanup_legacy_residues_in_dir(dir: &Path) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    reject_link(dir)?;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            if is_legacy_residue_filename(name) {
+                reject_link(&path)?;
+                if path.is_file() {
+                    fs::remove_file(&path).with_context(|| {
+                        format!("Failed to remove legacy backup temporary file '{}'", path.display())
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 const LOCK_FILES: &[&str] = &["parent.lock", "lock", ".parentlock"];
 
 fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
@@ -49,7 +116,7 @@ fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-pub fn stream_encrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> Result<()> {
+fn stream_encrypt<R: Read, W: Write>(reader: R, writer: W, password: &str) -> Result<()> {
     if password.is_empty() {
         bail!("Password cannot be empty for encrypted backup");
     }
@@ -70,9 +137,8 @@ pub fn stream_encrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> 
     let nonce_ga = aead::generic_array::GenericArray::from_slice(&nonce);
     let mut encryptor = EncryptorBE32::from_aead(cipher, nonce_ga);
 
-    let src_file = File::open(src_path)?;
-    let mut reader = BufReader::new(src_file);
-    let mut writer = BufWriter::new(File::create(dst_path)?);
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
 
     writer.write_all(&header)?;
 
@@ -98,7 +164,6 @@ pub fn stream_encrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> 
         }
 
         if next_len == 0 {
-            // current_buf is the last chunk
             let ct = encryptor
                 .encrypt_last(Payload {
                     msg: &current_buf[..current_len],
@@ -128,20 +193,26 @@ pub fn stream_encrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> 
     Ok(())
 }
 
-pub fn stream_decrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> Result<()> {
+fn stream_decrypt<R: Read, W: Write>(
+    reader: R,
+    writer: W,
+    password: &str,
+    max_total: u64,
+) -> Result<()> {
     if password.is_empty() {
         bail!("Password required for encrypted backup");
     }
 
-    let file_meta = fs::metadata(src_path)?;
-    let file_size = file_meta.len();
-    if file_size < (HEADER_LEN + 16) as u64 {
-        bail!("Corrupted backup archive: file truncated");
-    }
+    let mut reader = BufReader::new(reader);
+    let mut writer = BufWriter::new(writer);
 
-    let mut src_file = File::open(src_path)?;
     let mut header = [0u8; HEADER_LEN];
-    src_file.read_exact(&mut header)?;
+    if let Err(e) = reader.read_exact(&mut header) {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            bail!("Corrupted backup archive: file truncated");
+        }
+        return Err(e.into());
+    }
 
     if &header[0..8] != MAGIC {
         bail!("Invalid or unrecognized backup archive format");
@@ -157,9 +228,6 @@ pub fn stream_decrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> 
     let cipher = Aes256Gcm::new(aes_gcm::Key::<Aes256Gcm>::from_slice(&key));
     let nonce_ga = aead::generic_array::GenericArray::from_slice(nonce);
     let mut decryptor = DecryptorBE32::from_aead(cipher, nonce_ga);
-
-    let mut reader = BufReader::new(src_file);
-    let mut writer = BufWriter::new(File::create(dst_path)?);
 
     let mut chunk_len_buf = [0u8; 4];
     if let Err(e) = reader.read_exact(&mut chunk_len_buf) {
@@ -192,7 +260,7 @@ pub fn stream_decrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> 
                 total_decrypted = total_decrypted
                     .checked_add(pt.len() as u64)
                     .ok_or_else(|| anyhow!("Archive exceeds total maximum uncompressed size limit"))?;
-                if total_decrypted > MAX_TOTAL_UNCOMPRESSED {
+                if total_decrypted > max_total {
                     bail!("Archive exceeds total maximum uncompressed size limit");
                 }
                 writer.write_all(&pt)?;
@@ -219,7 +287,7 @@ pub fn stream_decrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> 
                 total_decrypted = total_decrypted
                     .checked_add(pt.len() as u64)
                     .ok_or_else(|| anyhow!("Archive exceeds total maximum uncompressed size limit"))?;
-                if total_decrypted > MAX_TOTAL_UNCOMPRESSED {
+                if total_decrypted > max_total {
                     bail!("Archive exceeds total maximum uncompressed size limit");
                 }
                 writer.write_all(&pt)?;
@@ -231,6 +299,7 @@ pub fn stream_decrypt_file(src_path: &Path, dst_path: &Path, password: &str) -> 
     writer.flush()?;
     Ok(())
 }
+
 
 fn scheduled_meta_path(store: &Store) -> PathBuf {
     store.root.join(".scheduled_backups.json")
@@ -344,18 +413,9 @@ fn validate_proxy_record(data: &Value) -> Result<Value> {
 }
 
 struct VerifiedArchive {
-    zip_path: PathBuf,
+    archive_file: File,
     is_encrypted: bool,
-    temp_decrypted_path: Option<PathBuf>,
     manifest: Value,
-}
-
-impl Drop for VerifiedArchive {
-    fn drop(&mut self) {
-        if let Some(path) = &self.temp_decrypted_path {
-            let _ = fs::remove_file(path);
-        }
-    }
 }
 
 pub struct Backups {
@@ -451,7 +511,7 @@ impl Backups {
         *self.is_running_scheduled.lock() = false;
 
         match result {
-            Ok(_path) => {
+            Ok(Some(_path)) => {
                 *self.last_error.lock() = String::new();
                 let retention = settings
                     .get("backup_retention")
@@ -460,6 +520,7 @@ impl Backups {
                 self.apply_retention(retention)?;
                 Ok(true)
             }
+            Ok(None) => Ok(false),
             Err(err) => {
                 let msg = err.to_string();
                 let _ = self
@@ -471,33 +532,31 @@ impl Backups {
         }
     }
 
-    fn run_scheduled_backup(&self, password: &str) -> Result<PathBuf> {
+    fn run_scheduled_backup(&self, password: &str) -> Result<Option<PathBuf>> {
         let _operation = self.store.operation.lock();
         let profiles = self.store.list("profiles")?;
         if profiles.is_empty() {
             bail!("No profiles available for scheduled backup");
         }
 
-        for prof in &profiles {
-            let id = string(prof, "id");
-            if self.runtime.is_running(id) {
-                bail!("Cannot start scheduled backup: profile '{id}' is currently running");
-            }
-        }
-
-        let ids: Vec<String> = profiles
+        let eligible: Vec<String> = profiles
             .iter()
             .map(|p| string(p, "id").to_string())
+            .filter(|id| !self.runtime.is_running(id))
             .collect();
 
-        let backup_path = self.create_internal(&ids, None, password, true)?;
+        if eligible.is_empty() {
+            return Ok(None);
+        }
+
+        let backup_path = self.create_internal(&eligible, None, password, true, ArchiveLimits::default())?;
 
         let now_str = utcnow();
         self.store.save_settings(json!({
             "last_scheduled_backup_at": now_str,
         }))?;
 
-        Ok(backup_path)
+        Ok(Some(backup_path))
     }
 
     pub fn apply_retention(&self, retention_count: usize) -> Result<()> {
@@ -635,13 +694,16 @@ impl Backups {
         Ok(())
     }
 
-    fn write_dir_to_zip(
-        zip: &mut ZipWriter<File>,
+    fn write_dir_to_zip<W: Write + Seek>(
+        zip: &mut ZipWriter<W>,
         dir: &Path,
         prefix: &str,
         manifest: &mut BTreeMap<String, Value>,
         opts: SimpleFileOptions,
         skip_lock_files: bool,
+        total_uncompressed: &mut u64,
+        entry_count: &mut usize,
+        limits: &ArchiveLimits,
     ) -> Result<()> {
         reject_link(dir)?;
         let mut entries = Vec::new();
@@ -651,10 +713,17 @@ impl Backups {
         let mut buffer = vec![0u8; CHUNK_SIZE];
         for (abs_path, rel_posix) in entries {
             reject_link(&abs_path)?;
-            let arcname = format!("{prefix}/{rel_posix}");
-            zip.start_file(&arcname, opts)?;
+            *entry_count += 1;
+            if *entry_count > limits.max_entries {
+                bail!("ZIP contains too many entries");
+            }
 
+            let arcname = format!("{prefix}/{rel_posix}");
             let mut file = File::open(&abs_path)?;
+            if file.metadata()?.len() > limits.max_single_file {
+                bail!("Archive entry exceeds maximum file size limit: {arcname}");
+            }
+            zip.start_file(&arcname, opts)?;
             let mut hasher = Sha256::new();
             let mut file_size: u64 = 0;
 
@@ -663,8 +732,19 @@ impl Backups {
                 if n == 0 {
                     break;
                 }
+                file_size = file_size
+                    .checked_add(n as u64)
+                    .ok_or_else(|| anyhow!("Archive entry exceeds maximum file size limit: {arcname}"))?;
+                if file_size > limits.max_single_file {
+                    bail!("Archive entry exceeds maximum file size limit: {arcname}");
+                }
+                *total_uncompressed = (*total_uncompressed)
+                    .checked_add(n as u64)
+                    .ok_or_else(|| anyhow!("Archive exceeds total maximum uncompressed size limit"))?;
+                if *total_uncompressed > limits.max_total_uncompressed {
+                    bail!("Archive exceeds total maximum uncompressed size limit");
+                }
                 hasher.update(&buffer[..n]);
-                file_size += n as u64;
                 zip.write_all(&buffer[..n])?;
             }
 
@@ -679,8 +759,194 @@ impl Backups {
         Ok(())
     }
 
+    fn populate_backup_zip<W: Write + Seek>(
+        &self,
+        zip: &mut ZipWriter<W>,
+        profiles_to_backup: &[Value],
+        proxies_dict: &BTreeMap<String, Value>,
+        versions_dict: &BTreeMap<String, Value>,
+        has_proxy_credentials: bool,
+        is_scheduled: bool,
+        limits: &ArchiveLimits,
+    ) -> Result<()> {
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let mut files_manifest = BTreeMap::new();
+        let mut clean_profiles_meta = Vec::new();
+        let mut total_uncompressed: u64 = 0;
+        let mut entry_count: usize = 0;
+
+        for prof in profiles_to_backup {
+            let pid = string(prof, "id");
+            let clean_prof = Self::scrub_profile_paths(prof)?;
+            let prof_json_bytes = serde_json::to_vec_pretty(&clean_prof)?;
+            if prof_json_bytes.len() as u64 > limits.max_metadata_size {
+                bail!("Profile metadata exceeds maximum size limit");
+            }
+            if prof_json_bytes.len() as u64 > limits.max_single_file { bail!("Archive entry exceeds maximum file size limit"); }
+            entry_count += 1;
+            if entry_count > limits.max_entries {
+                bail!("ZIP contains too many entries");
+            }
+            total_uncompressed = total_uncompressed
+                .checked_add(prof_json_bytes.len() as u64)
+                .ok_or_else(|| anyhow!("Archive exceeds total maximum uncompressed size limit"))?;
+            if total_uncompressed > limits.max_total_uncompressed {
+                bail!("Archive exceeds total maximum uncompressed size limit");
+            }
+
+            let prof_json_arc = format!("profiles/{pid}/profile.json");
+            let mut hasher = Sha256::new();
+            hasher.update(&prof_json_bytes);
+            files_manifest.insert(
+                prof_json_arc.clone(),
+                json!({
+                    "sha256": hex::encode(hasher.finalize()),
+                    "size": prof_json_bytes.len(),
+                }),
+            );
+
+            zip.start_file(&prof_json_arc, opts)?;
+            zip.write_all(&prof_json_bytes)?;
+
+            let addons_count = clean_prof
+                .get("extensions")
+                .and_then(Value::as_array)
+                .map_or(0, |a| a.len());
+            clean_profiles_meta.push(json!({
+                "id": pid,
+                "name": string(&clean_prof, "name"),
+                "browser_version": string(&clean_prof, "browser_version"),
+                "proxy_id": string(&clean_prof, "proxy_id"),
+                "addons_count": addons_count,
+            }));
+
+            let prof_dir = self.store.profile_dir(pid)?;
+            if prof_dir.is_dir() {
+                let browser_dir = prof_dir.join("browser");
+                if browser_dir.is_dir() {
+                    Self::write_dir_to_zip(
+                        zip,
+                        &browser_dir,
+                        &format!("profiles/{pid}/browser"),
+                        &mut files_manifest,
+                        opts,
+                        true,
+                        &mut total_uncompressed,
+                        &mut entry_count,
+                        limits,
+                    )?;
+                }
+                let addons_dir = prof_dir.join("addons");
+                if addons_dir.is_dir() {
+                    Self::write_dir_to_zip(
+                        zip,
+                        &addons_dir,
+                        &format!("profiles/{pid}/addons"),
+                        &mut files_manifest,
+                        opts,
+                        false,
+                        &mut total_uncompressed,
+                        &mut entry_count,
+                        limits,
+                    )?;
+                }
+            }
+        }
+
+        let mut proxies_meta = Vec::new();
+        for (px_id, px_data) in proxies_dict {
+            let px_bytes = serde_json::to_vec_pretty(px_data)?;
+            if px_bytes.len() as u64 > limits.max_metadata_size {
+                bail!("Proxy metadata exceeds maximum size limit");
+            }
+            if px_bytes.len() as u64 > limits.max_single_file { bail!("Archive entry exceeds maximum file size limit"); }
+            entry_count += 1;
+            if entry_count > limits.max_entries {
+                bail!("ZIP contains too many entries");
+            }
+            total_uncompressed = total_uncompressed
+                .checked_add(px_bytes.len() as u64)
+                .ok_or_else(|| anyhow!("Archive exceeds total maximum uncompressed size limit"))?;
+            if total_uncompressed > limits.max_total_uncompressed {
+                bail!("Archive exceeds total maximum uncompressed size limit");
+            }
+
+            let px_arc = format!("proxies/{px_id}.json");
+            let mut hasher = Sha256::new();
+            hasher.update(&px_bytes);
+            files_manifest.insert(
+                px_arc.clone(),
+                json!({
+                    "sha256": hex::encode(hasher.finalize()),
+                    "size": px_bytes.len(),
+                }),
+            );
+
+            zip.start_file(&px_arc, opts)?;
+            zip.write_all(&px_bytes)?;
+
+            let has_creds =
+                !string(px_data, "username").is_empty() || !string(px_data, "password").is_empty();
+            proxies_meta.push(json!({
+                "id": px_id,
+                "name": string(px_data, "name"),
+                "server": string(px_data, "server"),
+                "has_credentials": has_creds,
+                "has_password": !string(px_data, "password").is_empty(),
+            }));
+        }
+
+        let manifest = json!({
+            "schema_version": 1,
+            "app": "CamouManager",
+            "created_at": utcnow(),
+            "is_scheduled": is_scheduled,
+            "profiles_count": profiles_to_backup.len(),
+            "has_proxy_credentials": has_proxy_credentials,
+            "profiles": clean_profiles_meta,
+            "proxies": proxies_meta,
+            "versions": versions_dict,
+            "compatibility": {
+                "os": "windows",
+                "notes": "Cross-PC portable backup. Firefox databases (places, cookies, storage) and addons are portable across systems. Binaries are not included; target PC must have matching Camoufox browser version installed in the Versions tab.",
+            },
+            "files": files_manifest,
+        });
+
+        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        if manifest_bytes.len() as u64 > limits.max_manifest_size {
+            bail!("Manifest file exceeds size limit");
+        }
+        if manifest_bytes.len() as u64 > limits.max_single_file { bail!("Archive entry exceeds maximum file size limit"); }
+        entry_count += 1;
+        if entry_count > limits.max_entries {
+            bail!("ZIP contains too many entries");
+        }
+        total_uncompressed = total_uncompressed
+            .checked_add(manifest_bytes.len() as u64)
+            .ok_or_else(|| anyhow!("Archive exceeds total maximum uncompressed size limit"))?;
+        if total_uncompressed > limits.max_total_uncompressed {
+            bail!("Archive exceeds total maximum uncompressed size limit");
+        }
+
+        zip.start_file("manifest.json", opts)?;
+        zip.write_all(&manifest_bytes)?;
+        Ok(())
+    }
+
     pub fn create(&self, ids: &[String], destination: Option<&Path>, password: &str) -> Result<PathBuf> {
-        self.create_internal(ids, destination, password, false)
+        self.create_internal(ids, destination, password, false, ArchiveLimits::default())
+    }
+
+    #[cfg(test)]
+    fn create_with_limits(
+        &self,
+        ids: &[String],
+        destination: Option<&Path>,
+        password: &str,
+        limits: ArchiveLimits,
+    ) -> Result<PathBuf> {
+        self.create_internal(ids, destination, password, false, limits)
     }
 
     fn create_internal(
@@ -689,6 +955,7 @@ impl Backups {
         destination: Option<&Path>,
         password: &str,
         is_scheduled: bool,
+        limits: ArchiveLimits,
     ) -> Result<PathBuf> {
         if ids.is_empty() {
             bail!("No profile IDs specified for backup");
@@ -753,155 +1020,58 @@ impl Backups {
             }
         }
 
-        fs::create_dir_all(&self.store.root)?;
-        let temp_zip_path = if password.is_empty() {
-            target_path.with_file_name(format!("._backup_zip_{}.tmp", new_id()))
-        } else {
-            self.store.root.join(format!("_backup_zip_{}.tmp", new_id()))
-        };
+        if let Some(p) = target_path.parent() {
+            fs::create_dir_all(p)?;
+            reject_link(p)?;
+        }
+
         let temp_dest_path = target_path.with_file_name(format!(
             ".{}.{}.part",
             target_path.file_name().unwrap_or_default().to_string_lossy(),
             &new_id()[..6]
         ));
 
-        let build_res: Result<()> = (|| {
-            let file = File::create(&temp_zip_path)?;
-            let mut zip = ZipWriter::new(file);
-            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-
-            let mut files_manifest = BTreeMap::new();
-            let mut clean_profiles_meta = Vec::new();
-
-            for prof in &profiles_to_backup {
-                let pid = string(prof, "id");
-                let clean_prof = Self::scrub_profile_paths(prof)?;
-                let prof_json_bytes = serde_json::to_vec_pretty(&clean_prof)?;
-                let prof_json_arc = format!("profiles/{pid}/profile.json");
-
-                let mut hasher = Sha256::new();
-                hasher.update(&prof_json_bytes);
-                files_manifest.insert(
-                    prof_json_arc.clone(),
-                    json!({
-                        "sha256": hex::encode(hasher.finalize()),
-                        "size": prof_json_bytes.len(),
-                    }),
-                );
-
-                zip.start_file(&prof_json_arc, opts)?;
-                zip.write_all(&prof_json_bytes)?;
-
-                let addons_count = clean_prof
-                    .get("extensions")
-                    .and_then(Value::as_array)
-                    .map_or(0, |a| a.len());
-                clean_profiles_meta.push(json!({
-                    "id": pid,
-                    "name": string(&clean_prof, "name"),
-                    "browser_version": string(&clean_prof, "browser_version"),
-                    "proxy_id": string(&clean_prof, "proxy_id"),
-                    "addons_count": addons_count,
-                }));
-
-                let prof_dir = self.store.profile_dir(pid)?;
-                if prof_dir.is_dir() {
-                    let browser_dir = prof_dir.join("browser");
-                    if browser_dir.is_dir() {
-                        Self::write_dir_to_zip(
-                            &mut zip,
-                            &browser_dir,
-                            &format!("profiles/{pid}/browser"),
-                            &mut files_manifest,
-                            opts,
-                            true,
-                        )?;
-                    }
-                    let addons_dir = prof_dir.join("addons");
-                    if addons_dir.is_dir() {
-                        Self::write_dir_to_zip(
-                            &mut zip,
-                            &addons_dir,
-                            &format!("profiles/{pid}/addons"),
-                            &mut files_manifest,
-                            opts,
-                            false,
-                        )?;
-                    }
-                }
-            }
-
-            let mut proxies_meta = Vec::new();
-            for (px_id, px_data) in &proxies_dict {
-                let px_bytes = serde_json::to_vec_pretty(px_data)?;
-                let px_arc = format!("proxies/{px_id}.json");
-
-                let mut hasher = Sha256::new();
-                hasher.update(&px_bytes);
-                files_manifest.insert(
-                    px_arc.clone(),
-                    json!({
-                        "sha256": hex::encode(hasher.finalize()),
-                        "size": px_bytes.len(),
-                    }),
-                );
-
-                zip.start_file(&px_arc, opts)?;
-                zip.write_all(&px_bytes)?;
-
-                let has_creds =
-                    !string(px_data, "username").is_empty() || !string(px_data, "password").is_empty();
-                proxies_meta.push(json!({
-                    "id": px_id,
-                    "name": string(px_data, "name"),
-                    "server": string(px_data, "server"),
-                    "has_credentials": has_creds,
-                    "has_password": !string(px_data,"password").is_empty(),
-                }));
-            }
-
-            let manifest = json!({
-                "schema_version": 1,
-                "app": "CamouManager",
-                "created_at": utcnow(),
-                "is_scheduled": is_scheduled,
-                "profiles_count": profiles_to_backup.len(),
-                "has_proxy_credentials": has_proxy_credentials,
-                "profiles": clean_profiles_meta,
-                "proxies": proxies_meta,
-                "versions": versions_dict,
-                "compatibility": {
-                    "os": "windows",
-                    "notes": "Cross-PC portable backup. Firefox databases (places, cookies, storage) and addons are portable across systems. Binaries are not included; target PC must have matching Camoufox browser version installed in the Versions tab.",
-                },
-                "files": files_manifest,
-            });
-
-            let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-            zip.start_file("manifest.json", opts)?;
-            zip.write_all(&manifest_bytes)?;
-            zip.finish()?;
-            Ok(())
-        })();
-
-        if let Err(e) = build_res {
-            let _ = fs::remove_file(&temp_zip_path);
-            let _ = fs::remove_file(&temp_dest_path);
-            return Err(e);
-        }
-
-        let finalize_res: Result<()> = (|| {
-            if let Some(p) = target_path.parent() {
-                fs::create_dir_all(p)?;
-            }
-
+        let build_and_finalize = || -> Result<()> {
             if !password.is_empty() {
-                stream_encrypt_file(&temp_zip_path, &temp_dest_path, password)?;
-                fs::rename(&temp_dest_path, &target_path)?;
+                let mut temp_file = tempfile::tempfile_in(&self.store.root)?;
+                {
+                    let mut zip = ZipWriter::new(&mut temp_file);
+                    self.populate_backup_zip(
+                        &mut zip,
+                        &profiles_to_backup,
+                        &proxies_dict,
+                        &versions_dict,
+                        has_proxy_credentials,
+                        is_scheduled,
+                        &limits,
+                    )?;
+                    zip.finish()?;
+                }
+                temp_file.seek(SeekFrom::Start(0))?;
+                let mut dest_file = File::create(&temp_dest_path)?;
+                stream_encrypt(&mut temp_file, &mut dest_file, password)?;
+                dest_file.flush()?;
             } else {
-                fs::rename(&temp_zip_path, &temp_dest_path)?;
-                fs::rename(&temp_dest_path, &target_path)?;
+                let dest_file = File::create(&temp_dest_path)?;
+                let mut zip = ZipWriter::new(dest_file);
+                self.populate_backup_zip(
+                    &mut zip,
+                    &profiles_to_backup,
+                    &proxies_dict,
+                    &versions_dict,
+                    has_proxy_credentials,
+                    is_scheduled,
+                    &limits,
+                )?;
+                zip.finish()?;
             }
+
+            let final_size = fs::metadata(&temp_dest_path)?.len();
+            if final_size > limits.max_total_uncompressed + 1024 * 1024 {
+                bail!("Archive exceeds total maximum uncompressed size limit");
+            }
+
+            fs::rename(&temp_dest_path, &target_path)?;
 
             if is_scheduled {
                 if let Some(name) = target_path.file_name().and_then(|s| s.to_str()) {
@@ -924,15 +1094,25 @@ impl Backups {
                 "",
             );
             Ok(())
-        })();
+        };
 
-        let _ = fs::remove_file(&temp_zip_path);
-        let _ = fs::remove_file(&temp_dest_path);
-
-        finalize_res.map(|_| target_path)
+        let res = build_and_finalize();
+        if res.is_err() {
+            let _ = fs::remove_file(&temp_dest_path);
+        }
+        res.map(|_| target_path)
     }
 
     fn verify_archive(&self, path: &Path, password: &str) -> Result<VerifiedArchive> {
+        self.verify_archive_with_limits(path, password, ArchiveLimits::default())
+    }
+
+    fn verify_archive_with_limits(
+        &self,
+        path: &Path,
+        password: &str,
+        limits: ArchiveLimits,
+    ) -> Result<VerifiedArchive> {
         if !path.exists() {
             bail!("Backup file not found: {}", path.display());
         }
@@ -942,7 +1122,7 @@ impl Backups {
         if file_size == 0 {
             bail!("Corrupted backup archive: file is empty");
         }
-        if file_size > MAX_TOTAL_UNCOMPRESSED + 1024 * 1024 {
+        if file_size > limits.max_total_uncompressed + 1024 * 1024 {
             bail!("Archive exceeds total maximum uncompressed size limit");
         }
 
@@ -953,34 +1133,33 @@ impl Backups {
         }
 
         let is_encrypted;
-        let temp_decrypted_path;
-        let target_zip_path;
-
-        if &head == MAGIC {
+        let mut archive_file = if &head == MAGIC {
             is_encrypted = true;
             if password.is_empty() {
                 bail!("Password required for encrypted backup");
             }
-            let temp_dec = self.store.root.join(format!("_decrypted_zip_{}.tmp", new_id()));
-            if let Err(e) = stream_decrypt_file(path, &temp_dec, password) {
-                let _ = fs::remove_file(&temp_dec);
-                return Err(e);
+            let mut temp_dec = tempfile::tempfile_in(&self.store.root)?;
+            let src = File::open(path)?;
+            stream_decrypt(src, &mut temp_dec, password, limits.max_total_uncompressed)?;
+            #[cfg(test)]
+            if std::env::var_os("CAMOU_TEST_ABRUPT_EXIT_CHILD").is_some() {
+                std::process::exit(0);
             }
-            target_zip_path = temp_dec.clone();
-            temp_decrypted_path = Some(temp_dec);
+            temp_dec.seek(SeekFrom::Start(0))?;
+            temp_dec
         } else if head.starts_with(b"PK") {
             is_encrypted = false;
-            target_zip_path = path.to_path_buf();
-            temp_decrypted_path = None;
+            File::open(path)?
         } else {
             bail!("Invalid or unrecognized backup archive format");
-        }
+        };
 
         let verify_res: Result<Value> = (|| {
-            let mut zip = ZipArchive::new(File::open(&target_zip_path)?)
+            archive_file.seek(SeekFrom::Start(0))?;
+            let mut zip = ZipArchive::new(&mut archive_file)
                 .map_err(|e| anyhow!("Corrupted backup archive: invalid zip structure ({e})"))?;
 
-            if zip.len() > 100_000 {
+            if zip.len() > limits.max_entries {
                 bail!("ZIP contains too many entries");
             }
 
@@ -1009,21 +1188,26 @@ impl Backups {
                     bail!("Zip traversal detected: {fname}");
                 }
 
-                if entry.size() > MAX_SINGLE_FILE {
+                if entry.size() > limits.max_single_file {
                     bail!("Archive entry exceeds maximum file size limit: {fname}");
                 }
                 total_uncompressed = total_uncompressed
                     .checked_add(entry.size())
                     .ok_or_else(|| anyhow!("Archive exceeds total maximum uncompressed size limit"))?;
-                if total_uncompressed > MAX_TOTAL_UNCOMPRESSED {
+                if total_uncompressed > limits.max_total_uncompressed {
                     bail!("Archive exceeds total maximum uncompressed size limit");
                 }
 
                 if fname == "manifest.json" {
-                    if entry.size() > MAX_MANIFEST_SIZE {
+                    if entry.size() > limits.max_manifest_size {
                         bail!("Manifest file exceeds size limit");
                     }
                     manifest_info = Some(index);
+                } else if fname.starts_with("proxies/") || fname.strip_prefix("profiles/")
+                    .and_then(|path| path.split_once('/')).is_some_and(|(_, path)| path == "profile.json") {
+                    if entry.size() > limits.max_metadata_size {
+                        bail!("Metadata entry exceeds declared size limit: {fname}");
+                    }
                 }
             }
 
@@ -1043,7 +1227,7 @@ impl Backups {
                     decompressed_manifest_len = decompressed_manifest_len
                         .checked_add(n as u64)
                         .ok_or_else(|| anyhow!("Manifest file exceeds size limit"))?;
-                    if decompressed_manifest_len > MAX_MANIFEST_SIZE {
+                    if decompressed_manifest_len > limits.max_manifest_size {
                         bail!("Manifest file exceeds size limit");
                     }
                     manifest_bytes.extend_from_slice(&buffer[..n]);
@@ -1083,7 +1267,7 @@ impl Backups {
             }
 
             let mut total_actual_uncompressed: u64 = manifest_bytes.len() as u64;
-            if total_actual_uncompressed > MAX_TOTAL_UNCOMPRESSED {
+            if total_actual_uncompressed > limits.max_total_uncompressed {
                 bail!("Archive exceeds total maximum uncompressed size limit");
             }
 
@@ -1102,7 +1286,7 @@ impl Backups {
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("Missing SHA-256 integrity hash: {expected_file}"))?;
 
-                if expected_size > MAX_SINGLE_FILE {
+                if expected_size > limits.max_single_file {
                     bail!("Archive entry exceeds maximum file size limit: {expected_file}");
                 }
 
@@ -1110,7 +1294,7 @@ impl Backups {
                     .by_name(expected_file)
                     .map_err(|e| anyhow!("Corrupted file in backup archive: {expected_file} ({e})"))?;
 
-                if entry.size() > MAX_SINGLE_FILE {
+                if entry.size() > limits.max_single_file {
                     bail!("Archive entry exceeds maximum file size limit: {expected_file}");
                 }
 
@@ -1129,13 +1313,13 @@ impl Backups {
                         .checked_add(n as u64)
                         .ok_or_else(|| anyhow!("Archive exceeds total maximum uncompressed size limit"))?;
 
-                    if actual_size > MAX_SINGLE_FILE {
+                    if actual_size > limits.max_single_file {
                         bail!("Archive entry exceeds maximum file size limit: {expected_file}");
                     }
                     if actual_size > entry.size() || actual_size > expected_size {
                         bail!("Corrupted file in backup (size mismatch): {expected_file}");
                     }
-                    if total_actual_uncompressed > MAX_TOTAL_UNCOMPRESSED {
+                    if total_actual_uncompressed > limits.max_total_uncompressed {
                         bail!("Archive exceeds total maximum uncompressed size limit");
                     }
 
@@ -1199,9 +1383,12 @@ impl Backups {
                     bail!("Missing assigned proxy definition");
                 }
                 let mut p_entry = zip.by_name(&arc_name)?;
+                if p_entry.size() > limits.max_metadata_size {
+                    bail!("Metadata entry exceeds declared size limit: {arc_name}");
+                }
                 let mut p_bytes = Vec::new();
-                p_entry.by_ref().take(MAX_SINGLE_FILE + 1).read_to_end(&mut p_bytes)?;
-                if p_bytes.len() as u64 > MAX_SINGLE_FILE {
+                p_entry.by_ref().take(limits.max_metadata_size + 1).read_to_end(&mut p_bytes)?;
+                if p_bytes.len() as u64 > limits.max_metadata_size {
                     bail!("Archive entry exceeds maximum file size limit: {arc_name}");
                 }
                 let p_data: Value = serde_json::from_slice(&p_bytes)?;
@@ -1217,9 +1404,12 @@ impl Backups {
                     bail!("Missing profile definition");
                 }
                 let mut p_entry = zip.by_name(&arc_name)?;
+                if p_entry.size() > limits.max_metadata_size {
+                    bail!("Metadata entry exceeds declared size limit: {arc_name}");
+                }
                 let mut p_bytes = Vec::new();
-                p_entry.by_ref().take(MAX_SINGLE_FILE + 1).read_to_end(&mut p_bytes)?;
-                if p_bytes.len() as u64 > MAX_SINGLE_FILE {
+                p_entry.by_ref().take(limits.max_metadata_size + 1).read_to_end(&mut p_bytes)?;
+                if p_bytes.len() as u64 > limits.max_metadata_size {
                     bail!("Archive entry exceeds maximum file size limit: {arc_name}");
                 }
                 let p_data: Value = serde_json::from_slice(&p_bytes)?;
@@ -1256,20 +1446,18 @@ impl Backups {
         })();
 
         match verify_res {
-            Ok(manifest) => Ok(VerifiedArchive {
-                zip_path: target_zip_path,
-                is_encrypted,
-                temp_decrypted_path,
-                manifest,
-            }),
-            Err(e) => {
-                if let Some(p) = &temp_decrypted_path {
-                    let _ = fs::remove_file(p);
-                }
-                Err(e)
+            Ok(manifest) => {
+                archive_file.seek(SeekFrom::Start(0))?;
+                Ok(VerifiedArchive {
+                    archive_file,
+                    is_encrypted,
+                    manifest,
+                })
             }
+            Err(e) => Err(e),
         }
     }
+
 
     pub fn inspect(&self, path: &Path, password: &str) -> Result<Value> {
         let verified = self.verify_archive(path, password)?;
@@ -1368,7 +1556,16 @@ impl Backups {
     }
 
     pub fn restore(&self, path: &Path, password: &str) -> Result<Vec<Value>> {
-        let verified = self.verify_archive(path, password)?;
+        self.restore_with_limits(path, password, ArchiveLimits::default())
+    }
+
+    fn restore_with_limits(
+        &self,
+        path: &Path,
+        password: &str,
+        limits: ArchiveLimits,
+    ) -> Result<Vec<Value>> {
+        let mut verified = self.verify_archive_with_limits(path, password, limits)?;
         let manifest = &verified.manifest;
 
         let manifest_profiles = manifest
@@ -1405,16 +1602,22 @@ impl Backups {
         let mut staged_profiles = Vec::with_capacity(manifest_profiles.len());
 
         let extract_res: Result<()> = (|| {
-            extract_zip(
-                &verified.zip_path,
-                &staging_dir,
-                MAX_TOTAL_UNCOMPRESSED,
-                None,
-            )?;
+            verified.archive_file.seek(SeekFrom::Start(0))?;
+            extract_zip(&mut verified.archive_file, &staging_dir, limits.max_total_uncompressed, None)?;
 
             for (old_px_id, new_px_id) in &proxy_id_map {
                 let px_file = staging_dir.join("proxies").join(format!("{old_px_id}.json"));
-                let raw = fs::read_to_string(&px_file)?;
+                reject_link(&px_file)?;
+                let meta = fs::metadata(&px_file)?;
+                if meta.len() > limits.max_metadata_size {
+                    bail!("Proxy metadata file exceeds maximum size limit: {}", px_file.display());
+                }
+                let fh = File::open(&px_file)?;
+                let mut raw = String::new();
+                fh.take(limits.max_metadata_size + 1).read_to_string(&mut raw)?;
+                if raw.len() as u64 > limits.max_metadata_size {
+                    bail!("Proxy metadata file exceeds maximum size limit: {}", px_file.display());
+                }
                 let data: Value = serde_json::from_str(&raw)?;
                 let mut validated_px = validate_proxy_record(&data)?;
                 if let Some(obj) = validated_px.as_object_mut() {
@@ -1431,7 +1634,17 @@ impl Backups {
                     .join("profiles")
                     .join(old_prof_id)
                     .join("profile.json");
-                let raw = fs::read_to_string(&prof_file)?;
+                reject_link(&prof_file)?;
+                let meta = fs::metadata(&prof_file)?;
+                if meta.len() > limits.max_metadata_size {
+                    bail!("Profile metadata file exceeds maximum size limit: {}", prof_file.display());
+                }
+                let fh = File::open(&prof_file)?;
+                let mut raw = String::new();
+                fh.take(limits.max_metadata_size + 1).read_to_string(&mut raw)?;
+                if raw.len() as u64 > limits.max_metadata_size {
+                    bail!("Profile metadata file exceeds maximum size limit: {}", prof_file.display());
+                }
                 let data: Value = serde_json::from_str(&raw)?;
                 let mut validated_prof = crate::profiles::validate_backup_profile_record(&data)?;
                 if let Some(obj) = validated_prof.as_object_mut() {
@@ -1457,10 +1670,28 @@ impl Backups {
         }
 
         let _operation = self.store.operation.lock();
-        let mut created_records = Vec::new();
         let mut created_dirs = Vec::new();
 
         let commit_res: Result<Vec<Value>> = (|| {
+            let staged_profs_dir = staging_dir.join("staged_profiles");
+            for (_old_id, new_id) in &profile_id_map {
+                let src = staged_profs_dir.join(new_id);
+                let dest = self.store.profile_dir(new_id)?;
+                if dest.exists() {
+                    bail!("Restore ID collision; existing profile data will not be overwritten");
+                }
+                fs::remove_file(src.join("profile.json"))?;
+                fs::create_dir_all(src.join("browser"))?;
+                fs::create_dir_all(src.join("addons"))?;
+                fs::rename(&src, &dest)?;
+                created_dirs.push(dest);
+            }
+            #[cfg(test)]
+            if std::env::var_os("CAMOU_TEST_RESTORE_PUBLICATION_EXIT").is_some() {
+                std::process::exit(0);
+            }
+
+
             let mut batch = Vec::new();
             for px in staged_proxies {
                 batch.push(("proxies", px));
@@ -1470,34 +1701,6 @@ impl Backups {
             }
 
             let saved_batch = self.store.put_batch(batch)?;
-            for rec in &saved_batch {
-                let kind = if rec.get("server").is_some() {
-                    "proxies"
-                } else {
-                    "profiles"
-                };
-                created_records.push((kind, string(rec, "id").to_string()));
-            }
-
-            let staged_profs_dir = staging_dir.join("staged_profiles");
-            for (_old_id, new_id) in &profile_id_map {
-                let src = staged_profs_dir.join(new_id);
-                let dest = self.store.profile_dir(new_id)?;
-                if dest.exists() {
-                    bail!("Restore ID collision; existing profile data will not be overwritten");
-                }
-                fs::create_dir_all(&dest)?;
-                created_dirs.push(dest.clone());
-
-                let browser_src = src.join("browser");
-                if browser_src.exists() {
-                    copy_tree(&browser_src, &dest.join("browser"))?;
-                }
-                let addons_src = src.join("addons");
-                if addons_src.exists() {
-                    copy_tree(&addons_src, &dest.join("addons"))?;
-                }
-            }
 
             let restored_profiles: Vec<Value> = saved_batch
                 .into_iter()
@@ -1522,9 +1725,6 @@ impl Backups {
         match commit_res {
             Ok(profs) => Ok(profs),
             Err(err) => {
-                for (kind, id) in created_records.iter().rev() {
-                    let _ = self.store.delete(kind, id);
-                }
                 for dir in created_dirs.iter().rev() {
                     let _ = fs::remove_dir_all(dir);
                 }
@@ -1718,47 +1918,20 @@ mod tests {
 
     #[test]
     fn crypto_stream_roundtrip_tamper_and_wrong_password() {
-        let root = tempfile::tempdir().unwrap();
-        let plain = root.path().join("plain.bin");
-        let enc = root.path().join("enc.cmbak");
-        let dec = root.path().join("dec.bin");
-
-        let test_payload = b"Hello, CamouManager Rust backup encryption! Bounded memory streaming AEAD.";
-        fs::write(&plain, test_payload).unwrap();
-
-        // 1. Encrypt with password
-        stream_encrypt_file(&plain, &enc, "correct-horse-battery-staple").unwrap();
-        assert!(enc.exists());
-
-        // Raw encrypted file does NOT contain plain text
-        let enc_bytes = fs::read(&enc).unwrap();
-        assert!(!enc_bytes.windows(test_payload.len()).any(|w| w == test_payload));
-
-        // 2. Decrypt with correct password
-        stream_decrypt_file(&enc, &dec, "correct-horse-battery-staple").unwrap();
-        assert_eq!(fs::read(&dec).unwrap(), test_payload);
-
-        // 3. Decrypt with wrong password fails
-        let wrong_dec = root.path().join("wrong.bin");
-        let err = stream_decrypt_file(&enc, &wrong_dec, "wrong-password");
-        assert!(err.is_err());
-        assert!(!wrong_dec.exists() || fs::metadata(&wrong_dec).unwrap().len() == 0);
-
-        // 4. Tampering: flip a byte in ciphertext
-        let mut tampered_bytes = enc_bytes.clone();
-        let flip_idx = tampered_bytes.len() - 10;
-        tampered_bytes[flip_idx] ^= 0x55;
-        let tampered_file = root.path().join("tampered.cmbak");
-        fs::write(&tampered_file, &tampered_bytes).unwrap();
-
-        let tamp_dec = root.path().join("tamp_dec.bin");
-        assert!(stream_decrypt_file(&tampered_file, &tamp_dec, "correct-horse-battery-staple").is_err());
-
-        // 5. Truncation: truncate encrypted file
-        let truncated_file = root.path().join("truncated.cmbak");
-        fs::write(&truncated_file, &enc_bytes[..enc_bytes.len() - 20]).unwrap();
-        let trunc_dec = root.path().join("trunc_dec.bin");
-        assert!(stream_decrypt_file(&truncated_file, &trunc_dec, "correct-horse-battery-staple").is_err());
+        let payload = vec![0x5a; CHUNK_SIZE * 2 + 7];
+        let mut encrypted = Vec::new();
+        stream_encrypt(payload.as_slice(), &mut encrypted, "correct-password").unwrap();
+        assert!(!encrypted.windows(payload.len()).any(|window| window == payload));
+        let mut decrypted = Vec::new();
+        stream_decrypt(encrypted.as_slice(), &mut decrypted, "correct-password", MAX_TOTAL_UNCOMPRESSED).unwrap();
+        assert_eq!(decrypted, payload);
+        assert!(stream_decrypt(encrypted.as_slice(), std::io::sink(), "wrong-password", MAX_TOTAL_UNCOMPRESSED).is_err());
+        let mut tampered = encrypted.clone();
+        let index = tampered.len() - 10;
+        tampered[index] ^= 0x55;
+        assert!(stream_decrypt(tampered.as_slice(), std::io::sink(), "correct-password", MAX_TOTAL_UNCOMPRESSED).is_err());
+        assert!(stream_decrypt(&encrypted[..encrypted.len() - 20], std::io::sink(), "correct-password", MAX_TOTAL_UNCOMPRESSED).is_err());
+        assert!(stream_decrypt(encrypted.as_slice(), std::io::sink(), "correct-password", payload.len() as u64 - 1).is_err());
     }
 
     #[test]
@@ -1779,7 +1952,7 @@ mod tests {
 
         // Parent files::extract_zip or verify_archive rejects it
         let out_dir = root.path().join("extracted");
-        assert!(extract_zip(&bad_zip, &out_dir, 10_000_000, None).is_err());
+        assert!(extract_zip(File::open(&bad_zip).unwrap(), &out_dir, 10_000_000, None).is_err());
         assert!(!root.path().join("escaped.txt").exists());
         assert!(store.list("profiles").unwrap().is_empty());
     }
@@ -2373,5 +2546,303 @@ mod tests {
         assert!(res3.is_err());
         let err3 = res3.err().unwrap().to_string();
         assert!(err3.contains("maximum file size limit"));
+    }
+
+    #[test]
+    fn crash_safe_plaintext_cleanup_child_and_roundtrip() {
+        if let Ok(dir) = std::env::var("CAMOU_TEST_ABRUPT_EXIT_CHILD") {
+            let backend = crate::backend::Backend::open(PathBuf::from(dir)).unwrap();
+            let archive = std::env::var("CAMOU_TEST_CRASH_ARCHIVE").unwrap();
+            backend.backups.inspect(Path::new(&archive), "super-secret").unwrap();
+            panic!("Crash injection was not reached after plaintext decryption");
+        }
+        let root = tempfile::tempdir().unwrap();
+        // 2. Encrypted roundtrip create, inspect, restore leaves zero plaintext residue
+        let backend = crate::backend::Backend::open(root.path().join("store")).unwrap();
+        let p = backend.profiles.create(json!({
+            "name": "EncryptedRoundtrip",
+            "os": "windows",
+            "proxy_id": "",
+            "location": {"locked": true},
+            "fingerprint": {"audio:seed": 42}
+        })).unwrap();
+        let pid = string(&p, "id");
+        fs::write(backend.store.profile_dir(pid).unwrap().join("browser/cookies.sqlite"), b"private-cookie-test").unwrap();
+        let enc_dest = root.path().join("encrypted.cmbak");
+        let path = backend.backups.create(&[pid.to_string()], Some(&enc_dest), "super-secret").unwrap();
+        assert_eq!(path, enc_dest);
+        assert!(enc_dest.exists());
+        let child_home = root.path().join("crashed-inspection");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("CAMOU_TEST_ABRUPT_EXIT_CHILD", &child_home)
+            .env("CAMOU_TEST_CRASH_ARCHIVE", &enc_dest)
+            .args(["crash_safe_plaintext_cleanup_child_and_roundtrip", "--nocapture"])
+            .status().unwrap();
+        assert!(status.success());
+        for entry in fs::read_dir(&child_home).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                let bytes = fs::read(entry.path()).unwrap();
+                assert!(!bytes.starts_with(b"PK"), "Abrupt inspection left a plaintext ZIP in {:?}", entry.path());
+                assert!(!bytes.windows(b"private-cookie-test".len()).any(|bytes| bytes == b"private-cookie-test"),
+                    "Abrupt inspection left decrypted cookies in {:?}", entry.path());
+            }
+        }
+
+        // Inspect
+        let info = backend.backups.inspect(&enc_dest, "super-secret").unwrap();
+        assert_eq!(info["profiles_count"], 1);
+
+        // Restore into new store
+        let dst_backend = crate::backend::Backend::open(root.path().join("dst_store")).unwrap();
+        let restored = dst_backend.backups.restore(&enc_dest, "super-secret").unwrap();
+        assert_eq!(restored.len(), 1);
+        let restored_id = string(&restored[0], "id");
+        assert_eq!(fs::read(dst_backend.store.profile_dir(restored_id).unwrap().join("browser/cookies.sqlite")).unwrap(), b"private-cookie-test");
+
+        // Check neither store root has any .tmp files
+        for store_dir in [&backend.store.root, &dst_backend.store.root] {
+            for entry in fs::read_dir(store_dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().to_string();
+                assert!(!name.ends_with(".tmp"), "Found temporary file in store root: {name}");
+                assert!(!name.contains("_backup_zip_") && !name.contains("_decrypted_zip_"), "Found backup tmp residue: {name}");
+            }
+        }
+
+        // 3. Legacy residue cleanup removes known legacy residues and surfaces errors
+        let leg1 = backend.store.root.join("_backup_zip_11111111111111111111111111111111.tmp");
+        let leg2 = backend.store.root.join("_decrypted_zip_22222222222222222222222222222222.tmp");
+        fs::write(&leg1, b"legacy 1").unwrap();
+        fs::write(&leg2, b"legacy 2").unwrap();
+        let unrelated = backend.store.root.join("_backup_zip_report.tmp");
+        fs::write(&unrelated, b"unrelated user file").unwrap();
+        assert!(leg1.exists());
+        assert!(leg2.exists());
+        cleanup_legacy_residues(&backend.store.root).unwrap();
+        assert!(!leg1.exists());
+        assert!(!leg2.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated user file");
+    }
+
+    #[test]
+    fn restore_publication_rollback_ordering_deterministic_failure() {
+        if let Ok(dir) = std::env::var("CAMOU_TEST_RESTORE_PUBLICATION_EXIT") {
+            let backend = crate::backend::Backend::open(PathBuf::from(dir)).unwrap();
+            let archive = std::env::var("CAMOU_TEST_CRASH_ARCHIVE").unwrap();
+            backend.backups.restore(Path::new(&archive), "").unwrap();
+            panic!("Publication crash injection was not reached");
+        }
+        let root = tempfile::tempdir().unwrap();
+        let src_store = Arc::new(Store::open(root.path().join("src")).unwrap());
+        let src_net = Arc::new(crate::network::Network::new(src_store.clone()));
+        let src_fps = Arc::new(crate::fingerprints::FingerprintService::new(src_store.clone()).unwrap());
+        let src_runtime = Arc::new(crate::runtime::Runtime::new(src_store.clone(), src_net, src_fps.clone()));
+        let src_backups = Backups::new(src_store.clone(), src_runtime);
+
+        let p = src_store.put("profiles", json!({
+            "name": "RollbackTest",
+            "os": "windows",
+            "proxy_id": "",
+            "location": {},
+            "fingerprint": {"audio:seed": 7}
+        })).unwrap();
+        let pid = string(&p, "id");
+        let prof_dir = src_store.profile_dir(pid).unwrap();
+        fs::create_dir_all(prof_dir.join("browser")).unwrap();
+        fs::write(prof_dir.join("browser").join("cookies.sqlite"), b"browser-cookie-data").unwrap();
+
+        let archive = root.path().join("archive.zip");
+        src_backups.create(&[pid.to_string()], Some(&archive), "").unwrap();
+
+        let dst_store = Arc::new(Store::open(root.path().join("dst")).unwrap());
+        let dst_net = Arc::new(crate::network::Network::new(dst_store.clone()));
+        let dst_fps = Arc::new(crate::fingerprints::FingerprintService::new(dst_store.clone()).unwrap());
+        let dst_runtime = Arc::new(crate::runtime::Runtime::new(dst_store.clone(), dst_net, dst_fps));
+        let dst_backups = Backups::new(dst_store.clone(), dst_runtime);
+        let crashed_home = root.path().join("crashed-restore");
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("CAMOU_TEST_RESTORE_PUBLICATION_EXIT", &crashed_home)
+            .env("CAMOU_TEST_CRASH_ARCHIVE", &archive)
+            .args(["restore_publication_rollback_ordering_deterministic_failure", "--nocapture"])
+            .status().unwrap();
+        assert!(status.success());
+        let reopened = crate::backend::Backend::open(crashed_home).unwrap();
+        assert!(reopened.store.list("profiles").unwrap().is_empty());
+        assert!(reopened.store.list("proxies").unwrap().is_empty());
+        let published: Vec<_> = fs::read_dir(&reopened.store.profiles_dir).unwrap().map(|entry| entry.unwrap().path()).collect();
+        assert_eq!(published.len(), 1, "Fault must occur after profile directory publication");
+        assert_eq!(fs::read(published[0].join("browser/cookies.sqlite")).unwrap(), b"browser-cookie-data");
+
+        // Inject SQLite trigger to simulate deterministic DB failure during put_batch
+        let database = rusqlite::Connection::open(dst_store.root.join("state.sqlite3")).unwrap();
+        database.execute(
+            "CREATE TRIGGER fail_profiles BEFORE INSERT ON records WHEN NEW.kind = 'profiles' BEGIN SELECT RAISE(ABORT, 'Simulated DB failure during restore'); END;",
+            [],
+        ).unwrap();
+
+        let res = dst_backups.restore(&archive, "");
+        assert!(res.is_err());
+        let err_str = res.err().unwrap().to_string();
+        assert!(err_str.contains("Restore failed and was rolled back") || err_str.contains("Simulated DB failure"));
+
+        // Ordering & cleanup verification:
+        // No DB records exist
+        assert!(dst_store.list("profiles").unwrap().is_empty());
+        // All published profile directories in dst_store.profiles_dir were removed by rollback!
+        let remaining_profile_dirs: Vec<_> = fs::read_dir(&dst_store.profiles_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(remaining_profile_dirs.is_empty(), "Found orphan published profile dirs after rollback: {:?}", remaining_profile_dirs);
+
+        // Now drop trigger and verify normal restore succeeds
+        database.execute("DROP TRIGGER fail_profiles;", []).unwrap();
+        let restored = dst_backups.restore(&archive, "").unwrap();
+        assert_eq!(restored.len(), 1);
+        let restored_id = string(&restored[0], "id");
+        assert_eq!(fs::read(dst_store.profile_dir(restored_id).unwrap().join("browser/cookies.sqlite")).unwrap(), b"browser-cookie-data");
+    }
+
+    #[test]
+    fn create_and_restore_matching_boundaries_small_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let source = crate::backend::Backend::open(root.path().join("source")).unwrap();
+        let profile = source.profiles.create(json!({"name": "Limits", "os": "windows", "proxy_id": "",
+            "location": {"locked": true}, "fingerprint": {"audio:seed": 9}})).unwrap();
+        let id = string(&profile, "id").to_owned();
+        let payload = vec![b'C'; 8192];
+        fs::write(source.store.profile_dir(&id).unwrap().join("browser/profile.json"), &payload).unwrap();
+        let baseline = source.backups.create(&[id.clone()], Some(&root.path().join("baseline.zip")), "").unwrap();
+        let mut zip = ZipArchive::new(File::open(&baseline).unwrap()).unwrap();
+        let mut limits = ArchiveLimits {max_single_file: 0, max_total_uncompressed: 0,
+            max_entries: zip.len(), max_manifest_size: 0, max_metadata_size: 0};
+        let profile_metadata = format!("profiles/{id}/profile.json");
+        for index in 0..zip.len() {
+            let entry = zip.by_index(index).unwrap();
+            limits.max_single_file = limits.max_single_file.max(entry.size());
+            limits.max_total_uncompressed += entry.size();
+            if entry.name() == "manifest.json" { limits.max_manifest_size = entry.size(); }
+            if entry.name() == profile_metadata { limits.max_metadata_size = entry.size(); }
+        }
+        let matching = source.backups.create_with_limits(&[id.clone()], Some(&root.path().join("matching.zip")), "", limits).unwrap();
+        let target = crate::backend::Backend::open(root.path().join("target")).unwrap();
+        let restored = target.backups.restore_with_limits(&matching, "", limits).unwrap();
+        assert_eq!(restored[0]["fingerprint"], profile["fingerprint"]);
+        assert_eq!(fs::read(target.store.profile_dir(string(&restored[0], "id")).unwrap().join("browser/profile.json")).unwrap(), payload);
+        for (name, tighter) in [
+            ("single", ArchiveLimits {max_single_file: limits.max_single_file - 1, ..limits}),
+            ("total", ArchiveLimits {max_total_uncompressed: limits.max_total_uncompressed - 1, ..limits}),
+            ("entries", ArchiveLimits {max_entries: limits.max_entries - 1, ..limits}),
+            ("manifest", ArchiveLimits {max_manifest_size: limits.max_manifest_size - 1, ..limits}),
+            ("metadata", ArchiveLimits {max_metadata_size: limits.max_metadata_size - 1, ..limits}),
+        ] {
+            let rejected = root.path().join(format!("rejected-{name}.zip"));
+            assert!(source.backups.create_with_limits(&[id.clone()], Some(&rejected), "", tighter).is_err(), "Writer accepted {name} overflow");
+            assert!(!rejected.exists(), "Failed backup was published");
+            assert!(target.backups.restore_with_limits(&baseline, "", tighter).is_err(), "Reader accepted {name} overflow");
+            assert_eq!(target.store.list("profiles").unwrap().len(), 1, "Rejected restore published records");
+        }
+    }
+
+    #[test]
+    fn scheduler_mixed_running_and_stopped_and_all_running() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = crate::backend::Backend::open(root.path().join("store")).unwrap();
+        let backups = &backend.backups;
+
+        backend.store.save_settings(json!({
+            "backup_interval_hours": 24,
+        })).unwrap();
+        backups.set_password("scheduled-secret").unwrap();
+
+        let p1 = backend.profiles.create(json!({
+            "name": "Profile1",
+            "os": "windows",
+            "proxy_id": "",
+            "location": {"locked": true},
+            "fingerprint": {"audio:seed": 1}
+        })).unwrap();
+        let p1_id = string(&p1, "id").to_string();
+
+        let p2 = backend.profiles.create(json!({
+            "name": "Profile2",
+            "os": "windows",
+            "proxy_id": "",
+            "location": {"locked": true},
+            "fingerprint": {"audio:seed": 2}
+        })).unwrap();
+        let p2_id = string(&p2, "id").to_string();
+
+        // 1. ALL RUNNING: both profiles marked running
+        backend.runtime.mark_starting_for_test(&p1_id);
+        backend.runtime.mark_starting_for_test(&p2_id);
+
+        let ticked_all_running = backups.tick().unwrap();
+        // Returns false because none remain to be backed up
+        assert!(!ticked_all_running);
+        assert_eq!(backups.state().unwrap()["state"], "waiting");
+        assert!(backups.list().unwrap().is_empty());
+        let settings = backend.store.settings().unwrap();
+        let last_at = string(&settings, "last_scheduled_backup_at");
+        assert!(last_at.is_empty(), "last_scheduled_backup_at must not be set when all profiles are running");
+
+        // 2. MIXED RUNNING AND STOPPED: stop Profile2 while Profile1 is still running
+        backend.runtime.stop(&p2_id).unwrap();
+        assert!(backend.runtime.is_running(&p1_id));
+        assert!(!backend.runtime.is_running(&p2_id));
+
+        let ticked_mixed = backups.tick().unwrap();
+        assert!(ticked_mixed);
+        assert_eq!(backups.state().unwrap()["state"], "waiting");
+
+        let archives = backups.list().unwrap();
+        assert_eq!(archives.len(), 1);
+        let path = Path::new(archives[0]["path"].as_str().unwrap());
+        let info = backups.inspect(path, "scheduled-secret").unwrap();
+        let backed_up_ids: Vec<String> = info["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| string(p, "id").to_string())
+            .collect();
+        assert_eq!(backed_up_ids, vec![p2_id]);
+
+        let settings = backend.store.settings().unwrap();
+        let last_at = string(&settings, "last_scheduled_backup_at");
+        assert!(!last_at.is_empty(), "last_scheduled_backup_at must be recorded on successful backup");
+
+        // Cleanup running session
+        backend.runtime.stop(&p1_id).unwrap();
+    }
+
+    #[test]
+    fn metadata_oversize_and_actual_decoded_bound() {
+        let root = tempfile::tempdir().unwrap();
+        for proxy_metadata in [false, true] {
+            let source = crate::backend::Backend::open(root.path().join(format!("source-{proxy_metadata}"))).unwrap();
+            let proxy = if proxy_metadata {
+                source.store.put("proxies", json!({"name": "Proxy", "server": "http://127.0.0.1:19001", "enabled": true,
+                    "padding": "A".repeat(MAX_METADATA_SIZE as usize)})).unwrap()
+            } else { Value::Null };
+            let mut profile = json!({"name": "Metadata", "os": "windows", "proxy_id": string(&proxy, "id"),
+                "location": {"locked": true}, "fingerprint": {"audio:seed": 9}});
+            if !proxy_metadata { profile["padding"] = json!("A".repeat(MAX_METADATA_SIZE as usize)); }
+            let profile = source.store.put("profiles", profile).unwrap();
+            let id = string(&profile, "id").to_owned();
+            let permissive = ArchiveLimits {max_metadata_size: MAX_METADATA_SIZE + 4096, ..ArchiveLimits::default()};
+            let archive = source.backups.create_with_limits(&[id.clone()], Some(&root.path().join(format!("oversized-{proxy_metadata}.zip"))), "", permissive).unwrap();
+            assert!(fs::metadata(&archive).unwrap().len() < 64 * 1024, "Fixture must be small despite large decoded metadata");
+            assert!(source.backups.inspect(&archive, "").unwrap_err().to_string().contains("Metadata entry exceeds declared size limit"));
+            let target = crate::backend::Backend::open(root.path().join(format!("target-{proxy_metadata}"))).unwrap();
+            assert!(target.backups.restore(&archive, "").is_err());
+            assert!(target.store.list("profiles").unwrap().is_empty());
+            assert!(target.store.list("proxies").unwrap().is_empty());
+            let restored = target.backups.restore_with_limits(&archive, "", permissive).unwrap();
+            assert_eq!(restored[0]["fingerprint"], profile["fingerprint"], "Oversized fixture must otherwise be a valid archive");
+            let rejected = root.path().join(format!("rejected-metadata-{proxy_metadata}.zip"));
+            assert!(source.backups.create(&[id], Some(&rejected), "").is_err());
+            assert!(!rejected.exists());
+        }
     }
 }

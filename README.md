@@ -36,6 +36,14 @@ npm run build
 cargo test --manifest-path src-tauri/Cargo.toml --all-targets
 ```
 
+Smoke native cần binary Camoufox đã cài, chạy với hồ sơ/proxy kiểm thử riêng trong thư mục tạm:
+
+```powershell
+$env:CAMOUFOX_SMOKE_EXE = Join-Path $env:LOCALAPPDATA 'CamouManagerRust\versions\v156.0.1-beta.37\camoufox.exe'
+cargo test --release --manifest-path src-tauri/Cargo.toml --all-targets -- --include-ignored --nocapture --test-threads=1
+```
+
+
 Đóng gói installer và portable vào `dist/`:
 
 ```powershell
@@ -47,10 +55,17 @@ Script tạo lại `dist/CamouManager`; không để dữ liệu cá nhân trong
 ## Dữ liệu & lưu ý
 
 - Dữ liệu nằm tại `%LOCALAPPDATA%\CamouManagerRust`; có thể chọn thư mục khác bằng `CAMOUMANAGER_HOME`.
-- Backup chứa cookie, phiên đăng nhập và thông tin proxy. Nên đặt mật khẩu; không chia sẻ profile hoặc backup với người không tin cậy.
-- Sao lưu tự động chỉ chạy khi app mở, bỏ qua hồ sơ đang chạy; mật khẩu phiên cần nhập lại sau mỗi lần mở app.
+- Backup chứa cookie, phiên đăng nhập và thông tin proxy. Nên đặt mật khẩu; không chia sẻ profile hoặc backup với người không tin cậy. Mật khẩu chỉ mã hóa backup, không mã hóa dữ liệu hồ sơ/proxy đang lưu trong app.
+- ZIP plaintext tạm của backup mã hóa dùng file handle tự xóa khi tiến trình đóng; app dọn file tạm legacy có tên/ID đúng định dạng khi mở dữ liệu.
+- Tạo/khôi phục backup cùng áp dụng giới hạn: 4 GiB mỗi file, 20 GiB tổng dữ liệu giải nén, 100.000 entry, 10 MiB manifest và 4 MiB mỗi bản ghi JSON profile/proxy. Vượt giới hạn sẽ báo lỗi, không công bố backup thành công.
+- Sao lưu tự động chỉ chạy khi app mở, chỉ chọn hồ sơ đã dừng; nếu tất cả đang chạy thì bỏ lượt đó, không cập nhật thời gian hoàn tất hay áp dụng retention. Mật khẩu phiên cần nhập lại sau mỗi lần mở app.
 - Không hỗ trợ dữ liệu/backup của bản Python cũ. Gỡ cài đặt chỉ xóa dữ liệu mặc định khi chọn **Delete app data**; dữ liệu cũ và thư mục tùy chỉnh không bị xóa.
-- Ưu tiên proxy sticky session. Không cam kết chống khóa tài khoản; lỗi IP/WebRTC có thể khiến phiên bị đóng để bảo vệ kết nối.
+- Hồ sơ dùng proxy bật WebRTC ở chế độ **proxy-only + relay-only**: chỉ dùng TURN qua TCP/TLS và proxy đã gán; chặn STUN/UDP và ICE-TCP trực tiếp trước khi mở URL. Website phải cung cấp TURN tương thích và proxy phải cho phép tunnel tới TURN; không có đường đó thì kết nối thất bại, không fallback về mạng thật. Chuyển profile sang direct sẽ dùng kết nối thật.
+- Chính sách ICE/proxy được ghi vào user.js và khóa trong phiên. Không spoof IP WebRTC trong cấu hình launch của profile proxy: ICE dùng địa chỉ relay thật, có thể khác IP HTTP của proxy; fingerprint đã lưu không bị tạo lại. Quyền micro/camera vẫn do người dùng cấp. Với Camoufox v156.0.1-beta.37, datachannel không có capture/quyền media có thể không kết nối do cơ chế chọn default interface của engine.
+- Monitor cập nhật IP đang quan sát, kể cả proxy xoay IP; kiểm tra mỗi 10 giây, timeout request 15 giây. Lỗi mạng, phản hồi IP không hợp lệ hoặc monitor không tiến triển trong 45 giây được báo lỗi nhưng không đóng browser; giữ IP hợp lệ cuối cùng. Monitor tự thử lại, cập nhật IP và xóa lỗi khi phục hồi. Chính sách chặn đường ICE trực tiếp vẫn giữ nguyên trong lúc mất mạng và sau khi kết nối lại.
+- Preflight vẫn chặn khởi động nếu proxy chưa dùng được. Vi phạm chính sách ICE/proxy đã khóa vẫn đóng phiên để bảo vệ định tuyến; không áp dụng việc đóng phiên này cho lỗi mạng hoặc IP thay đổi.
+- SOCKS5 có credential bắt buộc xác thực username/password, không tự chuyển sang anonymous. Không còn fallback GeoIP HTTP khi dịch vụ HTTPS lỗi.
+- Ưu tiên proxy sticky session. Không cam kết chống fingerprint hay khóa tài khoản; chỉ cài extension đáng tin cậy.
 - Chỉ dùng phần mềm/tiện ích đáng tin cậy: cổng điều khiển BiDi nội bộ không có xác thực và tiện ích Experiment có quyền Gecko cao. Bản dựng chưa ký số có thể bị SmartScreen cảnh báo.
 
 ## License

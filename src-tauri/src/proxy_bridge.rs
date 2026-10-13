@@ -463,14 +463,9 @@ impl ProxyBridge {
         stream.set_read_timeout(Some(timeout))?;
         stream.set_write_timeout(Some(timeout))?;
 
-        // 1. Client greeting
+        // Configured credentials must not downgrade to an anonymous route.
         let has_auth = username.is_some() || password.is_some();
-        let greeting = if has_auth {
-            vec![0x05, 0x02, 0x00, 0x02] // NO AUTH (0x00), USER/PASS (0x02)
-        } else {
-            vec![0x05, 0x01, 0x00] // NO AUTH (0x00)
-        };
-        stream.write_all(&greeting)?;
+        stream.write_all(&[0x05, 0x01, if has_auth { 0x02 } else { 0x00 }])?;
 
         // 2. Server method response
         let mut method_resp = [0u8; 2];
@@ -479,11 +474,11 @@ impl ProxyBridge {
             bail!("Invalid SOCKS5 greeting version: {}", method_resp[0]);
         }
 
-        match method_resp[1] {
-            0x00 => {
-                // No authentication required
+        match (has_auth, method_resp[1]) {
+            (false, 0x00) => {
+                // Anonymous auth accepted
             }
-            0x02 => {
+            (true, 0x02) => {
                 // Username/password auth (RFC 1929)
                 let u = username.unwrap_or("");
                 let p = password.unwrap_or("");
@@ -506,8 +501,11 @@ impl ProxyBridge {
                     bail!("SOCKS5 authentication failed (status: {})", auth_resp[1]);
                 }
             }
-            0xFF => bail!("SOCKS5 server rejected all authentication methods (0xFF)"),
-            other => bail!("Unsupported SOCKS5 auth method: {}", other),
+            (true, 0x00) => {
+                bail!("SOCKS5 server attempted anonymous downgrade (0x00) when credentials are required");
+            }
+            (_, 0xFF) => bail!("SOCKS5 server rejected all authentication methods (0xFF)"),
+            (_, other) => bail!("Unsupported or unoffered SOCKS5 auth method: {}", other),
         }
 
         // 3. Send CONNECT command
@@ -1031,9 +1029,9 @@ mod tests {
         let socks_handle = std::thread::spawn(move || {
             let (mut stream, _) = socks_listener.accept().unwrap();
             // Read greeting
-            let mut greet = [0u8; 4];
+            let mut greet = [0u8; 3];
             stream.read_exact(&mut greet).unwrap();
-            assert_eq!(greet[0], 0x05);
+            assert_eq!(&greet, &[0x05, 0x01, 0x02]);
             // Select user/pass method 0x02
             stream.write_all(&[0x05, 0x02]).unwrap();
 
@@ -1127,8 +1125,9 @@ mod tests {
         let socks_port = socks_listener.local_addr().unwrap().port();
         let socks_handle = std::thread::spawn(move || {
             let (mut stream, _) = socks_listener.accept().unwrap();
-            let mut greet = [0u8; 4];
+            let mut greet = [0u8; 3];
             stream.read_exact(&mut greet).unwrap();
+            assert_eq!(&greet, &[0x05, 0x01, 0x02]);
             stream.write_all(&[0x05, 0x02]).unwrap();
 
             // Read auth request
@@ -2108,5 +2107,96 @@ mod tests {
         drop(client);
         drop(bridge);
         let _ = socks_handle.join();
+    }
+
+    #[test]
+    fn test_socks5_rejects_anonymous_downgrade_when_credentials_required() {
+        let socks_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks_port = socks_listener.local_addr().unwrap().port();
+        let socks_received_connect = Arc::new(AtomicBool::new(false));
+        let socks_rcv_clone = Arc::clone(&socks_received_connect);
+        let socks_handle = std::thread::spawn(move || {
+            let (mut stream, _) = socks_listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut greeting = [0u8; 2];
+            stream.read_exact(&mut greeting).unwrap();
+            let mut methods = vec![0; greeting[1] as usize];
+            stream.read_exact(&mut methods).unwrap();
+
+            // Server responds with unoffered anonymous auth (0x00)
+            stream.write_all(&[0x05, 0x00]).unwrap();
+
+            let mut next_bytes = [0u8; 4];
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            match stream.read(&mut next_bytes) {
+                Ok(0) | Err(_) => {}
+                Ok(_) => {
+                    socks_rcv_clone.store(true, Ordering::SeqCst);
+                }
+            }
+        });
+
+        let bridge = ProxyBridge::start(BridgeConfig {
+            upstream_protocol: UpstreamProtocol::Socks5,
+            upstream_host: "127.0.0.1".into(),
+            upstream_port: socks_port,
+            username: Some("alice".into()),
+            password: Some("secret123".into()),
+            root_store: None,
+        })
+        .unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", bridge.port())).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n").unwrap();
+
+        let mut resp = [0u8; b"HTTP/1.1 502 Bad Gateway\r\n\r\n".len()];
+        client.read_exact(&mut resp).unwrap();
+        assert_eq!(&resp, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+
+        drop(client);
+        drop(bridge);
+        socks_handle.join().unwrap();
+
+        assert!(!socks_received_connect.load(Ordering::SeqCst), "Bridge must not send CONNECT on downgrade");
+    }
+
+    #[test]
+    fn test_socks5_rejects_unoffered_auth_method_when_anonymous() {
+        let socks_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socks_port = socks_listener.local_addr().unwrap().port();
+        let socks_handle = std::thread::spawn(move || {
+            let (mut stream, _) = socks_listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut greeting = [0u8; 2];
+            stream.read_exact(&mut greeting).unwrap();
+            let mut methods = vec![0; greeting[1] as usize];
+            stream.read_exact(&mut methods).unwrap();
+
+            // Server selects unoffered method 0x02
+            stream.write_all(&[0x05, 0x02]).unwrap();
+        });
+
+        let bridge = ProxyBridge::start(BridgeConfig {
+            upstream_protocol: UpstreamProtocol::Socks5,
+            upstream_host: "127.0.0.1".into(),
+            upstream_port: socks_port,
+            username: None,
+            password: None,
+            root_store: None,
+        })
+        .unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", bridge.port())).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.write_all(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\n\r\n").unwrap();
+
+        let mut resp = [0u8; b"HTTP/1.1 502 Bad Gateway\r\n\r\n".len()];
+        client.read_exact(&mut resp).unwrap();
+        assert_eq!(&resp, b"HTTP/1.1 502 Bad Gateway\r\n\r\n");
+
+        drop(client);
+        drop(bridge);
+        socks_handle.join().unwrap();
     }
 }

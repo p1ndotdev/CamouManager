@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Result};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::{fs, net::IpAddr, path::{Path, PathBuf}, time::{Duration, Instant}};
 use crate::{files::reject_link, store::{new_id, string}};
 
@@ -12,7 +12,7 @@ pub(crate) struct IpSync {
 }
 
 impl IpSync {
-    pub(crate) fn prepare(profile_dir: &Path, endpoint: &str) -> Result<Self> {
+    pub(crate) fn prepare(profile_dir: &Path, endpoint: &str, proxy_prefs: &Value) -> Result<Self> {
         let manager_dir = profile_dir.join("manager-addons");
         let addon_dir = manager_dir.join("ip-sync");
         for path in [profile_dir, &manager_dir, &addon_dir] { reject_link(path)?; }
@@ -22,7 +22,7 @@ impl IpSync {
         let state_tmp = addon_dir.join("state.json.tmp");
         let manifest = json!({
             "manifest_version": 2,
-            "name": "CamouManager Proxy IP Synchronizer",
+            "name": "CamouManager Proxy IP Monitor",
             "version": "1.0.0",
             "browser_specific_settings": {"gecko": {"id": "camoumanager-ip-sync@local.invalid"}},
             "permissions": [url::Url::parse(endpoint)?.join("/")?.as_str().to_owned() + "*"],
@@ -32,12 +32,11 @@ impl IpSync {
             }}}
         });
         let schema = json!([{"namespace": "ipSync", "functions": [
-            {"name": "update", "type": "function", "async": true, "parameters": [{"name": "ip", "type": "string"}]},
             {"name": "confirm", "type": "function", "async": true, "parameters": [{"name": "ip", "type": "string"}]},
             {"name": "fail", "type": "function", "async": true, "parameters": [{"name": "message", "type": "string"}]}
         ]}]);
         let settings = json!({"endpoint": endpoint});
-        let native_settings = json!({"token": token, "statePath": state_path, "tmpPath": state_tmp});
+        let native_settings = json!({"token": token, "statePath": state_path, "tmpPath": state_tmp, "proxyPrefs": proxy_prefs});
         let files = [
             ("manifest.json", serde_json::to_string(&manifest)?),
             ("schema.json", serde_json::to_string(&schema)?),
@@ -61,15 +60,16 @@ impl IpSync {
         let state: Value = serde_json::from_slice(&fs::read(&self.state_path)?)?;
         if string(&state, "token") != self.token { bail!("Trạng thái đồng bộ IP không thuộc phiên hiện tại"); }
         let error = string(&state, "error");
-        if !error.is_empty() { bail!("Đồng bộ IP/WebRTC thất bại: {error}"); }
+        if !error.is_empty() { bail!("Đồng bộ IP thất bại: {error}"); }
         let sequence = state["sequence"].as_u64().ok_or_else(|| anyhow!("Trạng thái đồng bộ IP không hợp lệ"))?;
         let mut ip = None;
         if sequence != self.sequence {
-            ip = Some(string(&state, "ip").parse::<IpAddr>()?.to_string());
+            let observed: IpAddr = string(&state, "ip").parse()?;
+            ip = Some(observed.to_string());
             self.sequence = sequence;
             self.last_progress = Instant::now();
         }
-        if self.last_progress.elapsed() > Duration::from_secs(45) { bail!("Đồng bộ IP/WebRTC không phản hồi trong 45 giây"); }
+        if self.last_progress.elapsed() > Duration::from_secs(45) { bail!("Đồng bộ IP không phản hồi trong 45 giây"); }
         Ok(ip)
     }
 
@@ -92,37 +92,11 @@ pub(crate) fn update_profile_ip(profile: &mut Value, ip: &str) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn set_proxy_webrtc(config: &mut Map<String, Value>, prefs: &mut Map<String, Value>, ip: &str) -> Result<()> {
-    let ip: IpAddr = ip.parse()?;
-    // Live prefs must be the only source: an empty family must not fall back to a stale launch IP.
-    config.remove("webrtc:ipv4");
-    config.remove("webrtc:ipv6");
-    prefs.insert("roverfox.s.webrtc_ipv4_0".into(), json!(if ip.is_ipv4() { ip.to_string() } else { String::new() }));
-    prefs.insert("roverfox.s.webrtc_ipv6_0".into(), json!(if ip.is_ipv6() { ip.to_string() } else { String::new() }));
-    for key in ["roverfox.s.webrtc_v4_d_0", "roverfox.s.webrtc_v6_d_0"] { prefs.insert(key.into(), json!("1")); }
-    prefs.insert("extensions.experiments.enabled".into(), json!(true));
-    prefs.insert("network.dns.disableIPv6".into(), json!(false));
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn proxy_ip_replaces_both_stale_families_without_launch_fallback() {
-        let mut config = json!({"webrtc:ipv4": "198.51.100.1", "webrtc:ipv6": "2001:db8::1", "audio:seed": 7}).as_object().unwrap().clone();
-        let mut prefs = Map::new();
-        set_proxy_webrtc(&mut config, &mut prefs, "203.0.113.2").unwrap();
-        assert!(config.get("webrtc:ipv4").is_none() && config.get("webrtc:ipv6").is_none());
-        assert_eq!(prefs["roverfox.s.webrtc_ipv4_0"], "203.0.113.2");
-        assert_eq!(prefs["roverfox.s.webrtc_ipv6_0"], "");
-        set_proxy_webrtc(&mut config, &mut prefs, "2001:db8::2").unwrap();
-        assert_eq!(prefs["roverfox.s.webrtc_ipv4_0"], "");
-        assert_eq!(prefs["roverfox.s.webrtc_ipv6_0"], "2001:db8::2");
-        assert_eq!(config["audio:seed"], 7);
-        assert!(set_proxy_webrtc(&mut config, &mut prefs, "not-an-ip").is_err());
-    }
 
     #[test]
     fn observed_proxy_ip_wins_over_locked_location_and_preserves_identity() {
@@ -147,7 +121,7 @@ mod tests {
     #[test]
     fn synchronization_rejects_stale_sessions_bad_ips_and_lost_heartbeat() {
         let home = tempfile::tempdir().unwrap();
-        let mut sync = IpSync::prepare(home.path(), "https://api.ipify.org?format=json").unwrap();
+        let mut sync = IpSync::prepare(home.path(), "https://api.ipify.org?format=json", &Value::Null).unwrap();
         let state = |sync: &IpSync, ip: &str, token: &str, sequence: u64, error: &str| {
             fs::write(&sync.state_path, json!({"token": token, "sequence": sequence, "ip": ip, "error": error}).to_string()).unwrap();
         };
@@ -167,5 +141,7 @@ mod tests {
         assert!(sync.poll().is_err());
         state(&sync, "2001:db8::1", &sync.token, 3, "native update failed");
         assert!(sync.poll().unwrap_err().to_string().contains("native update failed"));
+        state(&sync, "203.0.113.2", &sync.token, 4, "");
+        assert_eq!(sync.poll().unwrap().as_deref(), Some("203.0.113.2"));
     }
 }

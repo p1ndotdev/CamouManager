@@ -56,6 +56,7 @@ impl Store {
         let backups_dir = root.join("backups");
         for directory in [&profiles_dir, &versions_dir, &backups_dir] { crate::files::reject_link(directory)?; fs::create_dir_all(directory)?; }
         crate::files::reject_link(&root.join("state.sqlite3"))?;
+        crate::backups::cleanup_legacy_residues(&root)?;
         let db = Connection::open(root.join("state.sqlite3"))?;
         db.busy_timeout(std::time::Duration::from_secs(30))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;

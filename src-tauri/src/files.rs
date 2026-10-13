@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use std::{collections::HashSet, fs, io::{Read, Write}, path::{Path, PathBuf}};
+use std::{collections::HashSet, fs, io::{Read, Seek, Write}, path::{Path, PathBuf}};
 
 pub fn reject_link(path: &Path) -> Result<()> {
     let metadata = match fs::symlink_metadata(path) {
@@ -52,9 +52,9 @@ fn archive_path(name: &str) -> Result<PathBuf> {
     Ok(relative)
 }
 
-pub fn extract_zip(archive: &Path, target: &Path, max_bytes: u64, cancel: Option<&dyn Fn() -> bool>) -> Result<bool> {
+pub fn extract_zip<R: Read + Seek>(archive: R, target: &Path, max_bytes: u64, cancel: Option<&dyn Fn() -> bool>) -> Result<bool> {
     reject_link(target)?;
-    let mut zip = zip::ZipArchive::new(fs::File::open(archive)?)?;
+    let mut zip = zip::ZipArchive::new(archive)?;
     if zip.len() > 100_000 { bail!("ZIP vượt giới hạn số file an toàn"); }
     let mut declared = 0u64;
     let mut names = HashSet::with_capacity(zip.len());
@@ -112,20 +112,20 @@ mod tests {
     fn validates_all_entries_before_creating_files() {
         let root = tempfile::tempdir().unwrap(); let output = root.path().join("output");
         let path = archive(root.path(), &["valid.txt", "../escape.txt"]);
-        assert!(extract_zip(&path, &output, 100, None).is_err());
+        assert!(extract_zip(fs::File::open(&path).unwrap(), &output, 100, None).is_err());
         assert!(!output.exists()); assert!(!root.path().join("escape.txt").exists());
     }
     #[test]
     fn rejects_case_collisions_ads_and_windows_ambiguous_names() {
         for names in [&["Foo", "foo"][..], &["file:stream"][..], &["CON.txt"][..], &["file."][..], &["dir\\escape"][..]] {
             let root = tempfile::tempdir().unwrap(); let path = archive(root.path(), names);
-            assert!(extract_zip(&path, &root.path().join("out"), 100, None).is_err());
+            assert!(extract_zip(fs::File::open(&path).unwrap(), &root.path().join("out"), 100, None).is_err());
         }
     }
     #[test]
     fn enforces_decoded_size_before_extraction() {
         let root = tempfile::tempdir().unwrap(); let path = archive(root.path(), &["data"]);
-        assert!(extract_zip(&path, &root.path().join("out"), 2, None).is_err());
+        assert!(extract_zip(fs::File::open(&path).unwrap(), &root.path().join("out"), 2, None).is_err());
         assert!(!root.path().join("out").exists());
     }
     #[test]
@@ -137,7 +137,7 @@ mod tests {
         let calls = Cell::new(0);
         let cancel = || { calls.set(calls.get()+1); calls.get()>3 };
         let out = root.path().join("out");
-        assert!(!extract_zip(&path,&out,2*1024*1024,Some(&cancel)).unwrap());
+        assert!(!extract_zip(fs::File::open(&path).unwrap(),&out,2*1024*1024,Some(&cancel)).unwrap());
         assert!(fs::metadata(out.join("large")).unwrap().len()<1024*1024);
     }
     #[cfg(unix)]

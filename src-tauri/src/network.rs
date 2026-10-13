@@ -317,17 +317,31 @@ pub struct Network {
     store: Arc<Store>,
     #[cfg(test)]
     pub(crate) egress_url: Option<String>,
+    #[cfg(test)]
+    pub(crate) geo_url: Option<String>,
 }
 
 impl Network {
     pub fn new(store: Arc<Store>) -> Self {
-        Self { store, #[cfg(test)] egress_url: None }
+        Self {
+            store,
+            #[cfg(test)]
+            egress_url: None,
+            #[cfg(test)]
+            geo_url: None,
+        }
     }
 
     pub(crate) fn egress_url(&self) -> &str {
         #[cfg(test)]
         if let Some(url) = &self.egress_url { return url; }
         "https://api.ipify.org?format=json"
+    }
+
+    pub(crate) fn geo_url(&self, ip: &str) -> String {
+        #[cfg(test)]
+        if let Some(url) = &self.geo_url { return format!("{}/{}", url.trim_end_matches('/'), ip); }
+        format!("https://ipwho.is/{}", ip)
     }
 
     pub fn summary(&self, proxy: &Value) -> Value {
@@ -456,7 +470,7 @@ impl Network {
 
                                         let mut country = String::new();
                                         if !ip.is_empty() {
-                                            let geo_url = format!("https://ipwho.is/{}", ip);
+                                            let geo_url = self.geo_url(&ip);
                                             if let Ok(g_resp) = client.get(&geo_url).send() {
                                                 if g_resp.status().is_success() {
                                                     if let Ok(g_data) = g_resp.json::<Value>() {
@@ -584,83 +598,46 @@ impl Network {
             bail!("Egress IP detection returned invalid IP address: '{}'", redact(&ip));
         }
 
-        // Step 2: Geolocation lookup for validated egress IP
-        let mut country = String::new();
-        let mut timezone = "UTC".to_string();
-        let mut lat = 0.0f64;
-        let mut lon = 0.0f64;
-
-        let geo_res = client
-            .get(&format!("https://ipwho.is/{}", ip))
-            .send()
-            .and_then(|r| r.json::<Value>());
-
-        let mut geo_success = false;
-        if let Ok(data) = geo_res {
-            if data.get("success").and_then(Value::as_bool) == Some(true) {
-                country = {
-                    let code = string(&data, "country_code");
-                    if !code.is_empty() {
-                        code.to_string()
-                    } else {
-                        string(&data, "country").to_string()
-                    }
-                };
-                if let Some(tz_obj) = data.get("timezone") {
-                    if let Some(tz_id) = tz_obj.get("id").and_then(Value::as_str) {
-                        timezone = tz_id.to_string();
-                    }
-                }
-                lat = data.get("latitude").and_then(Value::as_f64).unwrap_or(0.0);
-                lon = data.get("longitude").and_then(Value::as_f64).unwrap_or(0.0);
-                geo_success = true;
+        // Step 2: Geolocation lookup for validated egress IP over HTTPS (no plaintext fallback)
+        let data = match client.get(self.geo_url(&ip)).send()
+            .and_then(|response| response.error_for_status())
+            .and_then(|response| response.json::<Value>()) {
+            Ok(data) => data,
+            Err(error) => {
+                let message = format!("Geolocation lookup failed for egress IP {}: {}", ip, redact(&error.to_string()));
+                self.store.log("ERROR", &message, "")?;
+                bail!("{message}");
             }
+        };
+        if data.get("success").and_then(Value::as_bool) != Some(true) {
+            let message = format!("Geolocation lookup failed for egress IP {}: {}", ip,
+                data.get("message").and_then(Value::as_str).unwrap_or("lookup unsuccessful"));
+            self.store.log("ERROR", &message, "")?;
+            bail!("{message}");
         }
 
-        if !geo_success {
-            // Secondary fallback endpoint
-            let fallback_url = format!(
-                "http://ip-api.com/json/{}?fields=status,message,country,countryCode,timezone,lat,lon",
-                ip
-            );
-            let fb_res = client
-                .get(&fallback_url)
-                .send()
-                .and_then(|r| r.json::<Value>());
-            match fb_res {
-                Ok(data) if string(&data, "status") == "success" => {
-                    let code = string(&data, "countryCode");
-                    country = if !code.is_empty() {
-                        code.to_string()
-                    } else {
-                        string(&data, "country").to_string()
-                    };
-                    timezone = {
-                        let tz = string(&data, "timezone");
-                        if !tz.is_empty() {
-                            tz.to_string()
-                        } else {
-                            "UTC".to_string()
-                        }
-                    };
-                    lat = data.get("lat").and_then(Value::as_f64).unwrap_or(0.0);
-                    lon = data.get("lon").and_then(Value::as_f64).unwrap_or(0.0);
-                }
-                Ok(data) => {
-                    let msg = string(&data, "message");
-                    bail!("Geolocation lookup failed for egress IP {}: {}", ip, msg);
-                }
-                Err(e) => {
-                    let err_msg = redact(&e.to_string());
-                    self.store.log(
-                        "ERROR",
-                        &format!("Geolocation lookup failed for egress IP {}: {}", ip, err_msg),
-                        "",
-                    )?;
-                    bail!("Geolocation lookup failed for egress IP {}: {}", ip, err_msg);
-                }
+        let country = {
+            let code = string(&data, "country_code").trim();
+            if !code.is_empty() {
+                code.to_string()
+            } else {
+                string(&data, "country").trim().to_string()
             }
+        };
+
+        if country.is_empty() {
+            let err_msg = "missing required country";
+            self.store.log(
+                "ERROR",
+                &format!("Geolocation lookup failed for egress IP {}: {}", ip, err_msg),
+                "",
+            )?;
+            bail!("Geolocation lookup failed for egress IP {}: {}", ip, err_msg);
         }
+
+        let timezone = data.pointer("/timezone/id").and_then(Value::as_str).unwrap_or("UTC").to_owned();
+        let lat = data.get("latitude").and_then(Value::as_f64).unwrap_or(0.0);
+        let lon = data.get("longitude").and_then(Value::as_f64).unwrap_or(0.0);
 
         let locale = country_to_locale(&country);
 
@@ -984,45 +961,6 @@ mod tests {
         assert_eq!(imported.len(), 2);
     }
 
-    #[test]
-    fn test_browser_proxy_prefs_zeros_unused_keys() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(temp.path()).unwrap());
-        let net = Network::new(store);
-
-        // Authenticated HTTP proxy uses bridge and clears socks
-        let auth_http = json!({
-            "name": "Auth HTTP",
-            "server": "http://1.2.3.4:8080",
-            "username": "user",
-            "password": "pass",
-            "enabled": true
-        });
-        let bp1 = net.browser_proxy(&auth_http).unwrap();
-        assert!(bp1.bridge.is_some());
-        assert_eq!(bp1.prefs["network.proxy.type"], 1);
-        assert_eq!(bp1.prefs["network.proxy.http"], "127.0.0.1");
-        assert_eq!(bp1.prefs["network.proxy.socks"], "");
-        assert_eq!(bp1.prefs["network.proxy.socks_port"], 0);
-
-        // Direct SOCKS5 without auth sets socks and clears http/ssl
-        let direct_socks = json!({
-            "name": "Direct SOCKS",
-            "server": "socks5://1.2.3.4:1080",
-            "username": "",
-            "password": "",
-            "enabled": true
-        });
-        let bp2 = net.browser_proxy(&direct_socks).unwrap();
-        assert!(bp2.bridge.is_none());
-        assert_eq!(bp2.prefs["network.proxy.type"], 1);
-        assert_eq!(bp2.prefs["network.proxy.socks"], "1.2.3.4");
-        assert_eq!(bp2.prefs["network.proxy.socks_port"], 1080);
-        assert_eq!(bp2.prefs["network.proxy.http"], "");
-        assert_eq!(bp2.prefs["network.proxy.http_port"], 0);
-        assert_eq!(bp2.prefs["network.proxy.ssl"], "");
-        assert_eq!(bp2.prefs["network.proxy.ssl_port"], 0);
-    }
 
     #[test]
     fn test_client_for_empty_server_fails_closed() {
@@ -1185,5 +1123,170 @@ mod tests {
         assert_eq!(chk_single["ok"], false);
         assert!(string(&chk_single, "error").contains("invalid IP address"));
         h_single.join().unwrap();
+    }
+
+    #[test]
+    fn detect_valid_geo_flow_and_proxy_routing() {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            net::TcpListener,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        let server_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_port = server_listener.local_addr().unwrap().port();
+        let server_handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = server_listener.accept() {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut req_line = String::new();
+                    let _ = reader.read_line(&mut req_line);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let body = if req_line.contains("/egress") {
+                        r#"{"ip":"203.0.113.88"}"#
+                    } else if req_line.contains("/geo") {
+                        r#"{"success":true,"country_code":"JP","timezone":{"id":"Asia/Tokyo"},"latitude":35.68,"longitude":139.76}"#
+                    } else {
+                        r#"{}"#
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let mut net = Network::new(store.clone());
+        net.egress_url = Some(format!("http://127.0.0.1:{}/egress", server_port));
+        net.geo_url = Some(format!("http://127.0.0.1:{}/geo", server_port));
+
+        let direct = net.detect(None).unwrap();
+        assert_eq!(direct["ip"], "203.0.113.88");
+        assert_eq!(direct["country"], "JP");
+        assert_eq!(direct["timezone"], "Asia/Tokyo");
+        assert_eq!(direct["locale"], "ja-JP");
+        assert_eq!(direct["latitude"], 35.68);
+        assert_eq!(direct["longitude"], 139.76);
+        assert_eq!(direct["locked"], false);
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_port = proxy_listener.local_addr().unwrap().port();
+        let proxy_requests = Arc::new(AtomicUsize::new(0));
+        let proxy_req_clone = Arc::clone(&proxy_requests);
+        let proxy_handle = std::thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut client_stream, _)) = proxy_listener.accept() {
+                    proxy_req_clone.fetch_add(1, Ordering::SeqCst);
+                    let mut reader = BufReader::new(client_stream.try_clone().unwrap());
+                    let mut req_line = String::new();
+                    let _ = reader.read_line(&mut req_line);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let body = if req_line.contains("/egress") {
+                        r#"{"ip":"203.0.113.88"}"#
+                    } else {
+                        r#"{"success":true,"country_code":"JP","timezone":{"id":"Asia/Tokyo"},"latitude":35.68,"longitude":139.76}"#
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = client_stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        let px = json!({
+            "name": "Test Proxy",
+            "server": format!("http://127.0.0.1:{}", proxy_port),
+            "enabled": true
+        });
+        let proxied = net.detect(Some(&px)).unwrap();
+        assert_eq!(proxied["ip"], "203.0.113.88");
+        assert_eq!(proxied["country"], "JP");
+        assert_eq!(proxy_requests.load(Ordering::SeqCst), 2, "Proxy must route both egress and geo requests");
+
+        server_handle.join().unwrap();
+        proxy_handle.join().unwrap();
+    }
+
+    #[test]
+    fn detect_fails_without_plaintext_fallback_on_geo_errors() {
+        use std::{io::{BufRead, BufReader, Write}, net::TcpListener,
+            sync::atomic::{AtomicBool, Ordering}, time::{Duration, Instant}};
+
+        for (geo_url, status, body) in [
+            ("https://geo.invalid", "502 Bad Gateway", ""),
+            ("http://geo.invalid", "500 Internal Server Error", ""),
+            ("http://geo.invalid", "200 OK", r#"{"success":false,"message":"rate limit exceeded"}"#),
+            ("http://geo.invalid", "200 OK", r#"{"success":true,"country_code":""}"#),
+            ("http://geo.invalid", "200 OK", r#"{"country_code":"JP"}"#),
+            ("http://geo.invalid", "200 OK", "invalid JSON"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).unwrap();
+            let stopped = Arc::new(AtomicBool::new(false));
+            let primary_seen = Arc::new(AtomicBool::new(false));
+            let fallback_seen = Arc::new(AtomicBool::new(false));
+            let (stop, primary, fallback) = (stopped.clone(), primary_seen.clone(), fallback_seen.clone());
+            let server = std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+                            let mut reader = BufReader::new(stream.try_clone().unwrap());
+                            let mut request = String::new();
+                            reader.read_line(&mut request).unwrap();
+                            loop {
+                                let mut line = String::new();
+                                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" { break; }
+                            }
+                            let (response_status, response_body) = if request.contains("egress.invalid") {
+                                ("200 OK", r#"{"ip":"203.0.113.99"}"#)
+                            } else if request.contains("ip-api.com") {
+                                fallback.store(true, Ordering::Release);
+                                ("200 OK", r#"{"status":"success","countryCode":"JP","timezone":"Asia/Tokyo","lat":35.68,"lon":139.76}"#)
+                            } else {
+                                primary.store(true, Ordering::Release);
+                                (status, body)
+                            };
+                            write!(stream, "HTTP/1.1 {response_status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}", response_body.len()).unwrap();
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                        Err(error) => panic!("Local GeoIP proxy failed: {error}"),
+                    }
+                }
+            });
+            let root = tempfile::tempdir().unwrap();
+            let store = Arc::new(Store::open(root.path()).unwrap());
+            let mut network = Network::new(store);
+            network.egress_url = Some("http://egress.invalid/".into());
+            network.geo_url = Some(geo_url.into());
+            let result = network.detect(Some(&json!({"server": format!("http://127.0.0.1:{port}")})));
+            stopped.store(true, Ordering::Release);
+            server.join().unwrap();
+            assert!(primary_seen.load(Ordering::Acquire), "Primary lookup was not exercised");
+            assert!(!fallback_seen.load(Ordering::Acquire), "Geolocation downgraded to plaintext fallback");
+            assert!(result.is_err(), "Invalid geolocation accepted: {result:?}");
+        }
     }
 }

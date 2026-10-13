@@ -1135,7 +1135,7 @@ impl Versions {
 
         let cancel_fn = || self.cancel_requested.load(Ordering::SeqCst);
         let extracted = crate::files::extract_zip(
-            &temp_zip,
+            File::open(&temp_zip)?,
             &staging_dir,
             MAX_UNCOMPRESSED_ARCHIVE_BYTES,
             Some(&cancel_fn),

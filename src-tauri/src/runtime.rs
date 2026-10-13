@@ -17,11 +17,15 @@ use crate::{
     bidi::BrowserSession,
     files::reject_link,
     fingerprints::FingerprintService,
-    ip_sync::{set_proxy_webrtc, update_profile_ip, IpSync},
+    ip_sync::{update_profile_ip, IpSync},
     network::{BrowserProxy, Network},
     store::{redact, safe_component, string, utcnow, Store},
     versions::version_sort_key,
 };
+
+#[cfg(test)]
+#[path = "webrtc_smoke.rs"]
+mod webrtc_smoke;
 
 const WINDOWS_11_MARKER_FONTS: &[&str] = &[
     "Sans Serif Collection",
@@ -319,9 +323,7 @@ pub fn build_default_prefs(
         json!(gpc_enabled),
     );
 
-    if config.contains_key("webrtc:ipv4") {
-        prefs.insert("network.dns.disableIPv6".into(), json!(true));
-    }
+    prefs.insert("network.dns.disableIPv6".into(), json!(proxy_prefs.is_none() && config.contains_key("webrtc:ipv4")));
 
     if config.contains_key("geolocation:latitude") && config.contains_key("geolocation:longitude") {
         prefs.insert("permissions.default.geo".into(), json!(1));
@@ -358,7 +360,18 @@ pub fn build_default_prefs(
     prefs.insert("intl.locale.requested".into(), json!(requested_locale));
 
     prefs.insert("permissions.default.image".into(), json!(1));
+    // Force proxy routing even on about:blank; relay candidates must be real, not spoofed.
     prefs.insert("media.peerconnection.enabled".into(), json!(true));
+    prefs.insert("media.peerconnection.ice.proxy_only".into(), json!(proxy_prefs.is_some()));
+    prefs.insert("media.peerconnection.ice.relay_only".into(), json!(proxy_prefs.is_some()));
+    prefs.insert("media.peerconnection.ice.default_address_only".into(), json!(proxy_prefs.is_none()));
+    prefs.insert("network.proxy.failover_direct".into(), json!(proxy_prefs.is_none()));
+    prefs.insert("network.proxy.allow_bypass".into(), json!(proxy_prefs.is_none()));
+    prefs.insert("network.proxy.socks5_remote_dns".into(), json!(true));
+    prefs.insert("media.webrtc.tls_tunnel_for_all_proxy".into(), json!(true));
+    if proxy_prefs.is_some() {
+        prefs.insert("extensions.experiments.enabled".into(), json!(true));
+    }
     prefs.insert(
         "browser.tabs.remote.useCrossOriginOpenerPolicy".into(),
         json!(true),
@@ -394,6 +407,41 @@ pub fn build_default_prefs(
 
     prefs
 }
+
+fn prepare_webrtc_pref(browser_dir: &Path, prefs: &Map<String, Value>) -> Result<()> {
+    use std::io::{Read, Write};
+    let path = browser_dir.join("user.js");
+    reject_link(&path)?;
+    let old = match fs::File::open(&path) {
+        Ok(file) => {
+            let mut text = String::new();
+            file.take(4 * 1024 * 1024 + 1).read_to_string(&mut text)?;
+            if text.len() > 4 * 1024 * 1024 { bail!("Profile user.js exceeds 4 MiB"); }
+            text
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut file = tempfile::NamedTempFile::new_in(browser_dir)?;
+    let mut ends_with_newline = true;
+    for line in old.split_inclusive('\n') {
+        if !line.trim_end().ends_with(" // CamouManager WebRTC") {
+            file.write_all(line.as_bytes())?;
+            ends_with_newline = line.ends_with('\n');
+        }
+    }
+    // User-branch prefs override CAMOU_PREFS; enforce this before any startup URL can run.
+    if !ends_with_newline { writeln!(file)?; }
+    for (key, value) in prefs {
+        if key.starts_with("media.peerconnection.") || key.starts_with("network.proxy.") || key.starts_with("media.webrtc.") {
+            writeln!(file, "user_pref({}, {}); // CamouManager WebRTC", serde_json::to_string(key)?, value)?;
+        }
+    }
+    file.as_file().sync_all()?;
+    file.persist(&path)?;
+    Ok(())
+}
+
 
 fn clean_managed_bookmarks(bookmarks: &[Value]) -> Result<Vec<Value>> {
     let mut clean_bms = Vec::new();
@@ -994,7 +1042,6 @@ struct ProfileSession {
     bridge: Option<BrowserProxy>,
     driver: Option<BrowserSession>,
     ip_sync: Option<IpSync>,
-    ip_sync_failure: Option<(Instant, String)>,
     pid: Option<u32>,
     state: String,
     error: String,
@@ -1013,7 +1060,6 @@ impl ProfileSession {
             bridge: None,
             driver: None,
             ip_sync: None,
-            ip_sync_failure: None,
             pid: None,
             state: "error".into(),
             error,
@@ -1031,7 +1077,6 @@ impl ProfileSession {
             bridge: None,
             driver: None,
             ip_sync: None,
-            ip_sync_failure: None,
             pid: None,
             state: "starting".into(),
             error: String::new(),
@@ -1198,7 +1243,6 @@ impl ProfileSession {
         self.bridge = None;
         self.driver = None;
         self.ip_sync = None;
-        self.ip_sync_failure = None;
         self.child = None;
         #[cfg(windows)]
         {
@@ -1212,23 +1256,12 @@ impl ProfileSession {
     }
 
     fn refresh_proxy_ip(&mut self) -> Result<Option<String>> {
-        if let Some((deadline, error)) = &self.ip_sync_failure {
-            if Instant::now() >= *deadline {
-                let error = error.clone();
-                self.finish_stop();
-                self.state = "error".into();
-                self.error = error;
-            }
-            return Ok(None);
-        }
         let Some(sync) = self.ip_sync.as_mut() else { return Ok(None); };
         match sync.poll() {
-            Ok(ip) => Ok(ip),
+            Ok(ip) => { self.error.clear(); Ok(ip) },
             Err(error) => {
                 let message = format!("{error:#}");
-                let grace = self.begin_graceful_stop();
-                self.ip_sync_failure = Some((Instant::now() + grace, message.clone()));
-                self.state = "error".into();
+                if self.error == message { return Ok(None); }
                 self.error = message;
                 Err(error)
             }
@@ -1244,6 +1277,11 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    #[cfg(test)]
+    pub(crate) fn mark_starting_for_test(&self, id: &str) {
+        self.sessions.lock().insert(id.to_owned(), ProfileSession::new_starting());
+    }
+
     pub fn new(
         store: Arc<Store>,
         network: Arc<Network>,
@@ -1373,7 +1411,6 @@ impl Runtime {
             // 4. Proxy preflight check (fail closed) and proxy bridge acquisition
             let proxy_id = string(&profile, "proxy_id").trim().to_owned();
             let mut browser_proxy: Option<BrowserProxy> = None;
-            let mut preflight_ip = String::new();
 
             if !proxy_id.is_empty() {
                 let proxy = self
@@ -1386,6 +1423,7 @@ impl Runtime {
                         string(&proxy, "name")
                     );
                 }
+                let preflight_ip;
                 let mut location = if profile["location"]["locked"].as_bool().unwrap_or(false) {
                     let check = self.network.check(&proxy)?;
                     if !check["ok"].as_bool().unwrap_or(false) {
@@ -1503,7 +1541,7 @@ impl Runtime {
                 .context("Bookmark addon preparation failed")?;
             addon_paths.push(browser_path_string(&bm_addon_dir));
             let ip_sync = if browser_proxy.is_some() {
-                let sync = IpSync::prepare(&profile_dir, self.network.egress_url())?;
+                let sync = IpSync::prepare(&profile_dir, self.network.egress_url(), &browser_proxy.as_ref().unwrap().prefs)?;
                 addon_paths.push(browser_path_string(&sync.addon_dir));
                 Some(sync)
             } else { None };
@@ -1527,6 +1565,11 @@ impl Runtime {
                 .as_object()
                 .cloned()
                 .ok_or_else(|| anyhow!("Profile fingerprint must be a JSON object"))?;
+            if browser_proxy.is_some() {
+                // Camoufox spoofing forces default-route UDP discovery and fabricates unusable ICE.
+                config_map.remove("webrtc:ipv4");
+                config_map.remove("webrtc:ipv6");
+            }
 
 
             config_map.remove("webGl2Enabled");
@@ -1538,14 +1581,12 @@ impl Runtime {
                 Value::Array(addon_paths.into_iter().map(Value::String).collect()),
             );
 
-            let mut user_prefs = build_default_prefs(
+            let user_prefs = build_default_prefs(
                 &config_map,
                 browser_proxy.as_ref().map(|bp| &bp.prefs),
                 !clean_bms.is_empty(),
             );
-            if browser_proxy.is_some() {
-                set_proxy_webrtc(&mut config_map, &mut user_prefs, &preflight_ip)?;
-            }
+            prepare_webrtc_pref(&browser_dir, &user_prefs)?;
 
             // Drop pref-backed DNT / GPC from CAMOU_CONFIG just like camoufox/utils.py
             config_map.remove("navigator.doNotTrack");
@@ -1718,7 +1759,6 @@ impl Runtime {
                     bridge: browser_proxy,
                     driver: None,
                     ip_sync,
-                    ip_sync_failure: None,
                     pid: Some(child_pid),
                     state: "starting".into(),
                     error: String::new(),
@@ -1834,7 +1874,7 @@ impl Runtime {
                         }
                         if !sync_is_ready {
                             if Instant::now() >= deadline {
-                                bail!("Đồng bộ IP/WebRTC không sẵn sàng sau 20 giây");
+                                bail!("Đồng bộ IP không sẵn sàng sau 20 giây");
                             }
                             std::thread::sleep(Duration::from_millis(50));
                             continue;
@@ -1967,7 +2007,7 @@ impl Runtime {
             }
             let entry = if let Some(session) = sessions.get_mut(&pid_str) {
                 if session.is_alive() {
-                    if session.state != "starting" {
+                    if session.state == "running" {
                         match session.refresh_proxy_ip() {
                             Ok(Some(ip)) => {
                                 if update_profile_ip(&mut profile, &ip)? {
@@ -2023,6 +2063,20 @@ impl Drop for Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_user_preferences_fail_without_truncating_the_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("user.js");
+        let original = b"user_pref(\"browser.startup.homepage\", \"https://example.com\");\n";
+        fs::write(&path, original).unwrap();
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(4 * 1024 * 1024 + 1).unwrap();
+        let error = prepare_webrtc_pref(root.path(), &Map::new()).unwrap_err();
+        assert!(error.to_string().contains("exceeds 4 MiB"));
+        assert_eq!(fs::metadata(&path).unwrap().len(), 4 * 1024 * 1024 + 1);
+        assert!(fs::read(&path).unwrap().starts_with(original));
+    }
+
 
     fn write_mock_browser_bundle(dir: &Path) -> PathBuf {
         fs::create_dir_all(dir).unwrap();
@@ -2142,54 +2196,6 @@ mod tests {
         assert!(validate_and_filter_config(&mut bad_voices, &exe).is_err());
     }
 
-    #[test]
-    fn default_prefs_match_camoufox_upstream_rules() {
-        let mut win10_cfg = Map::new();
-        win10_cfg.insert(
-            "navigator.userAgent".into(),
-            json!(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:156.0) Gecko/20100101 Firefox/156.0"
-            ),
-        );
-        win10_cfg.insert("fonts".into(), json!(["Arial", "Segoe UI", "Tahoma"]));
-        win10_cfg.insert("locale:language".into(), json!("vi"));
-        win10_cfg.insert("locale:region".into(), json!("VN"));
-        win10_cfg.insert("geolocation:latitude".into(), json!(10.8231));
-        win10_cfg.insert("geolocation:longitude".into(), json!(106.6297));
-        win10_cfg.insert("webrtc:ipv4".into(), json!("203.0.113.10"));
-
-        let prefs = build_default_prefs(&win10_cfg, None, true);
-        assert_eq!(prefs["ui.useOverlayScrollbars"], 0);
-        assert_eq!(prefs["intl.locale.requested"], "vi-VN");
-        assert_eq!(prefs["permissions.default.geo"], 1);
-        assert_eq!(prefs["network.dns.disableIPv6"], true);
-        assert_eq!(prefs["network.proxy.type"], 0);
-        assert_eq!(prefs["browser.toolbars.bookmarks.visibility"], "always");
-        assert!(!prefs.contains_key("gfx.font_rendering.fallback.async"));
-
-        // Windows 11 marker font switches overlay scrollbars to 1
-        let mut win11_cfg = win10_cfg.clone();
-        win11_cfg.insert("fonts".into(), json!(["Segoe UI", "Segoe UI Variable"]));
-        let prefs_win11 = build_default_prefs(&win11_cfg, None, false);
-        assert_eq!(prefs_win11["ui.useOverlayScrollbars"], 1);
-
-        // Linux sets gfx.font_rendering.fallback.async = false
-        let mut lin_cfg = Map::new();
-        lin_cfg.insert(
-            "navigator.userAgent".into(),
-            json!("Mozilla/5.0 (X11; Linux x86_64; rv:156.0) Gecko/20100101 Firefox/156.0"),
-        );
-        let proxy_prefs = json!({
-            "network.proxy.type": 1,
-            "network.proxy.http": "127.0.0.1",
-            "network.proxy.http_port": 18080
-        });
-        let prefs_lin = build_default_prefs(&lin_cfg, Some(&proxy_prefs), false);
-        assert_eq!(prefs_lin["ui.useOverlayScrollbars"], 1);
-        assert_eq!(prefs_lin["gfx.font_rendering.fallback.async"], false);
-        assert_eq!(prefs_lin["network.proxy.type"], 1);
-        assert_eq!(prefs_lin["network.proxy.http_port"], 18080);
-    }
 
     #[test]
     fn bookmark_urls_reject_executable_schemes_and_option_injection() {
@@ -2581,7 +2587,7 @@ mod tests {
     #[test]
     #[ignore]
     fn smoke_real_browser_rotating_proxy_and_fail_closed() {
-        use std::{io::{Read, Write}, net::TcpListener, sync::atomic::{AtomicBool, Ordering}};
+        use std::{io::{Read, Write}, net::{TcpListener, UdpSocket}, sync::atomic::{AtomicBool, Ordering}};
         let exe = PathBuf::from(std::env::var("CAMOUFOX_SMOKE_EXE").expect("CAMOUFOX_SMOKE_EXE required"));
         assert!(exe.is_file());
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2596,6 +2602,7 @@ mod tests {
             while !stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let ip = ip.clone();
                         clients.push(std::thread::spawn(move || {
                             stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -2648,51 +2655,52 @@ mod tests {
             "startup_urls": ["http://egress.invalid/probe"], "fingerprint_meta": {"use_preset": true}
         })).unwrap();
         let id = string(&profile, "id");
+        fs::write(store.profile_dir(id).unwrap().join("browser/user.js"),
+            "user_pref(\"media.peerconnection.enabled\", true);\nuser_pref(\"browser.startup.homepage\", \"about:blank\");\n").unwrap();
         assert_eq!(runtime.launch(id, true).unwrap()["state"], "running");
-        let native_probe = r#"(async () => {
-            const pc = new RTCPeerConnection({iceServers: [{urls: 'stun:127.0.0.1:3478'}]});
-            let timer;
-            try {
-                const addresses = [];
-                const done = new Promise(resolve => {
-                    timer = setTimeout(resolve, 1500);
-                    pc.onicecandidate = event => {
-                        if (!event.candidate) return resolve();
-                        const fields = event.candidate.candidate.split(/\s+/);
-                        if (fields[fields.indexOf('typ') + 1] === 'srflx') addresses.push(fields[4]);
-                    };
-                });
-                pc.createDataChannel('privacy-smoke');
-                await pc.setLocalDescription(await pc.createOffer());
-                await done;
-                const stats = [...(await pc.getStats()).values()].filter(s => s.type === 'local-candidate').map(s => s.address);
-                return JSON.stringify({addresses, stats, sdp: pc.localDescription.sdp, dpr: devicePixelRatio});
-            } finally { clearTimeout(timer); pc.close(); }
-        })()"#;
-        let probe = || runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().evaluate_json(native_probe).unwrap();
-        runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().evaluate_json("JSON.stringify(document.cookie = 'privacy_session=persisted; Max-Age=3600; Path=/; SameSite=Lax')").unwrap();
+        runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().navigate_for_test("http://egress.invalid/probe").unwrap();
+        let route = UdpSocket::bind("0.0.0.0:0").unwrap();
+        route.connect("192.0.2.1:9").unwrap();
+        let stun = UdpSocket::bind((route.local_addr().unwrap().ip(), 0)).unwrap();
+        stun.set_nonblocking(true).unwrap();
+        let native_probe = r#"(() => {
+            const PeerConnection = globalThis.RTCPeerConnection || globalThis.mozRTCPeerConnection;
+            if (typeof PeerConnection !== 'function') {
+                return JSON.stringify({blocked: true, dpr: devicePixelRatio});
+            }
+            const pc = new PeerConnection({iceServers: [{urls: 'stun:STUN_ENDPOINT'}]});
+            globalThis.__privacyProbe = pc;
+            pc.createDataChannel('privacy-smoke');
+            pc.createOffer().then(offer => pc.setLocalDescription(offer)).catch(error => {
+                globalThis.__privacyProbeError = String(error);
+            });
+            return JSON.stringify({blocked: false, dpr: devicePixelRatio});
+        })()"#.replace("STUN_ENDPOINT", &stun.local_addr().unwrap().to_string());
+        let probe = || runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().evaluate_json(&native_probe).unwrap();
+        let cookie = runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().evaluate_json(
+            "(() => { document.cookie = 'privacy_session=persisted; Max-Age=3600; Path=/; SameSite=Lax'; return JSON.stringify(document.cookie); })()").unwrap();
+        assert!(cookie.as_str().unwrap().contains("privacy_session=persisted"), "Initial cookie write failed: {cookie}");
         let initial = store.get("profiles", id).unwrap().unwrap();
         let mut stable_identity = initial["fingerprint"].clone();
         stable_identity.as_object_mut().unwrap().remove("webrtc:ipv4");
         stable_identity.as_object_mut().unwrap().remove("webrtc:ipv6");
-        for address in ["203.0.113.11", "203.0.113.12", "203.0.113.13"] {
+        let pid = runtime.status().unwrap()[id]["pid"].clone();
+        for address in ["203.0.113.11", "203.0.113.12", "203.0.113.13", "2001:db8::12", "203.0.113.14"] {
             *current_ip.lock() = address.to_owned();
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 let status = runtime.status().unwrap();
                 assert_eq!(status[id]["state"], "running", "{status}");
+                assert_eq!(status[id]["pid"], pid, "Rotation must not restart the browser: {status}");
                 if status[id]["egress_ip"] == address { break; }
-                assert!(Instant::now() < deadline, "IP did not rotate: {status}");
+                assert!(Instant::now() < deadline, "Rotating IP was not updated: {status}");
                 std::thread::sleep(Duration::from_millis(100));
             }
             let native = probe();
-            let addresses = native["addresses"].as_array().unwrap();
-            assert!(!addresses.is_empty(), "{native}");
-            assert!(addresses.iter().all(|value| value == address), "{native}");
-            assert!(!native["sdp"].as_str().unwrap().contains("198.51.100.9"));
-            for old in ["203.0.113.11", "203.0.113.12", "2001:db8::12"] {
-                if old != address { assert!(!native.to_string().contains(old), "{native}"); }
-            }
+            assert_eq!(native["blocked"], false, "WebRTC must remain available behind proxy: {native}");
+            std::thread::sleep(Duration::from_secs(1));
+            let error = stun.recv_from(&mut [0; 2048]).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock, "Direct STUN traffic escaped proxy");
             let saved = store.get("profiles", id).unwrap().unwrap();
             assert_eq!(saved["location"]["ip"], address);
             assert_eq!(saved["location"]["timezone"], "Asia/Ho_Chi_Minh");
@@ -2701,48 +2709,58 @@ mod tests {
             identity.as_object_mut().unwrap().remove("webrtc:ipv6");
             assert_eq!(identity, stable_identity);
             if let Some(dpr) = identity["window.devicePixelRatio"].as_f64() { assert_eq!(native["dpr"].as_f64(), Some(dpr)); }
-            println!("PASS native candidates/SDP/stats, persisted IP and stable identity: {address}");
+            println!("PASS live IP rotation, same browser PID, no direct STUN UDP and stable identity: {address}");
         }
-        *current_ip.lock() = "2001:db8::12".into();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let status = runtime.status().unwrap();
-            if status[id]["state"] == "running" && status[id]["egress_ip"] == "2001:db8::12" {
-                let native = probe();
-                let addresses = native["addresses"].as_array().unwrap();
-                assert!(!addresses.is_empty() && addresses.iter().all(|value| value == "2001:db8::12"), "{native}");
-                assert!(!native.to_string().contains("203.0.113.13"), "{native}");
-                println!("PASS native IPv6 rotation");
-                break;
-            }
-            if status[id]["state"] == "error" && !runtime.is_running(id) {
-                assert_eq!(status[id]["egress_ip"], "203.0.113.13");
-                println!("PASS unsupported native IPv6 fails closed, without accepting the IP: {}", status[id]["error"]);
-                break;
-            }
-            assert!(Instant::now() < deadline, "IPv6 neither applied nor failed closed: {status}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        *current_ip.lock() = "203.0.113.14".into();
-        if !runtime.is_running(id) { runtime.launch(id, true).unwrap(); }
         *current_ip.lock() = "invalid-ip".into();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let status = runtime.status().unwrap();
-            if status[id]["state"] == "error" && !runtime.is_running(id) {
-                assert!(status[id]["error"].as_str().unwrap().contains("IP"), "{status}");
-                break;
-            }
-            assert!(Instant::now() < deadline, "Browser did not fail closed: {status}");
+            assert_eq!(status[id]["state"], "running", "{status}");
+            assert_eq!(status[id]["pid"], pid, "{status}");
+            assert_eq!(status[id]["egress_ip"], "203.0.113.14", "Invalid IP must not replace the last valid IP");
+            if !status[id]["error"].as_str().unwrap().is_empty() { break; }
+            assert!(Instant::now() < deadline, "Invalid IP was not reported: {status}");
             std::thread::sleep(Duration::from_millis(100));
         }
-        println!("PASS invalid IP closes native browser and exposes error");
+        println!("PASS invalid IP reports an error without closing the browser or replacing its IP");
         *current_ip.lock() = "203.0.113.14".into();
-        runtime.launch(id, true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = runtime.status().unwrap();
+            assert_eq!(status[id]["state"], "running", "{status}");
+            assert_eq!(status[id]["pid"], pid, "{status}");
+            if status[id]["error"] == "" { break; }
+            assert!(Instant::now() < deadline, "IP monitor did not recover: {status}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
         let cookie = runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().evaluate_json("JSON.stringify(document.cookie)").unwrap();
         assert!(cookie.as_str().unwrap().contains("privacy_session=persisted"), "{cookie}");
         runtime.stop(id).unwrap();
-        println!("PASS session cookie survives privacy shutdown and relaunch");
+        println!("PASS session cookie survives live IP changes and monitor recovery");
+        profiles.update(id, json!({"proxy_id": "", "startup_urls": ["about:blank"]})).unwrap();
+        runtime.launch(id, true).unwrap();
+        let navigation = runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().navigate_for_test("about:blank");
+        assert!(navigation.is_ok(), "Direct navigation failed: {navigation:?}; status: {:?}; stderr: {}",
+            runtime.status().unwrap(), runtime.sessions.lock().get(id).unwrap().stderr_tail.lock().as_str());
+        let direct = probe();
+        assert_eq!(direct["blocked"], false, "Direct profile must retain WebRTC: {direct}");
+        stun.set_nonblocking(false).unwrap();
+        stun.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut packet = [0; 2048];
+        let (length, _) = match stun.recv_from(&mut packet) {
+            Ok(packet) => packet,
+            Err(error) => {
+                let state = runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().evaluate_json(
+                    "JSON.stringify({error: globalThis.__privacyProbeError, ice: globalThis.__privacyProbe.iceGatheringState, signaling: globalThis.__privacyProbe.signalingState})").unwrap();
+                panic!("Direct positive control did not reach STUN: {error}; native state: {state}");
+            }
+        };
+        assert!(length >= 20, "Expected a STUN binding request");
+        assert_eq!(&packet[4..8], &[0x21, 0x12, 0xa4, 0x42], "Expected STUN magic cookie");
+        runtime.sessions.lock().get_mut(id).unwrap().driver.as_mut().unwrap().evaluate_json(
+            "(() => { globalThis.__privacyProbe.close(); delete globalThis.__privacyProbe; return JSON.stringify(true); })()").unwrap();
+        runtime.stop(id).unwrap();
+        println!("PASS proxy-to-direct transition restores WebRTC and confirms UDP listener works");
     }
 
     #[test]
@@ -2811,7 +2829,6 @@ mod tests {
                         bridge: None,
                         driver: None,
                         ip_sync: None,
-                        ip_sync_failure: None,
                         pid: Some(child_pid),
                         state: "starting".into(),
                         error: String::new(),

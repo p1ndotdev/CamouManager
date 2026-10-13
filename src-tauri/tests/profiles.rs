@@ -49,6 +49,31 @@ fn bulk_preflight_prevents_partial_mutation_and_metadata_edits_keep_identity() {
 }
 
 #[test]
+fn missing_preset_flag_and_false_preserve_identity_and_session_on_editor_save() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Backend::open(root.path().to_owned()).unwrap();
+    let profile = backend.request("profile.create", json!({"data": {
+        "name": "Legacy metadata", "os": "windows", "proxy_id": "",
+        "location": {"locked": true}, "fingerprint_meta": {}
+    }}), None).unwrap();
+    let id = profile["id"].as_str().unwrap();
+    let cookies = backend.store.profile_dir(id).unwrap().join("browser/cookies.sqlite");
+    fs::write(&cookies, b"persistent login").unwrap();
+    let saved = backend.request("profile.update", json!({"id": id, "data": {
+        "name": "Renamed in editor", "note": "New note", "fingerprint_meta": {"use_preset": false}
+    }}), None).unwrap();
+    assert_eq!(saved["name"], "Renamed in editor");
+    assert_eq!(saved["fingerprint"], profile["fingerprint"]);
+    assert!(saved["fingerprint_meta"].get("regenerated_at").is_none());
+    let omitted = backend.request("profile.update", json!({"id": id, "data": {
+        "bookmarks": [{"title": "Saved bookmark", "url": "https://example.com"}], "fingerprint_meta": {}
+    }}), None).unwrap();
+    assert_eq!(omitted["fingerprint"], profile["fingerprint"]);
+    assert_eq!(fs::read(cookies).unwrap(), b"persistent login");
+}
+
+
+#[test]
 fn unencrypted_export_restores_identity_and_session_at_selected_destination() {
     let root = tempfile::tempdir().unwrap();
     let destination = match std::env::var_os("CAMOUMANAGER_SMOKE_BACKUP_DIR") {

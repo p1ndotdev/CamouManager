@@ -33,7 +33,10 @@ impl BrowserSession {
         self.next_id += 1;
         let id = self.next_id;
         self.socket.send(Message::Text(serde_json::to_string(&json!({"id":id,"method":method,"params":params}))?.into()))?;
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let timeout = Duration::from_secs(3);
+        #[cfg(test)]
+        let timeout = self.socket.get_ref().read_timeout()?.unwrap_or(timeout).max(timeout);
+        let deadline = Instant::now() + timeout;
         for _ in 0..32 {
             if Instant::now() >= deadline { bail!("Phiên native không phản hồi: {method}"); }
             match self.socket.read()? {
@@ -51,6 +54,19 @@ impl BrowserSession {
         bail!("Phiên native trả quá nhiều thông báo không liên quan")
     }
     pub(crate) fn close(mut self) -> Result<()> { self.call("browser.close",json!({})).map(|_| ()) }
+    #[cfg(test)]
+    pub(crate) fn navigate_for_test(&mut self, url: &str) -> Result<()> {
+        self.socket.get_mut().set_read_timeout(Some(Duration::from_secs(15)))?;
+        let result = (|| {
+            let tree = self.call("browsingContext.getTree", json!({})).context("Native context discovery failed")?;
+            let context = tree["contexts"][0]["context"].as_str().context("Không có tab để kiểm tra native")?;
+            self.call("browsingContext.navigate", json!({"context": context, "url": url, "wait": "complete"}))
+                .context("Native full-page navigation failed")?;
+            Ok(())
+        })();
+        self.socket.get_mut().set_read_timeout(Some(Duration::from_secs(2)))?;
+        result
+    }
     #[cfg(test)]
     pub(crate) fn evaluate_json(&mut self, expression: &str) -> Result<Value> {
         let tree = self.call("browsingContext.getTree", json!({}))?;

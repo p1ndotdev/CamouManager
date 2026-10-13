@@ -185,7 +185,8 @@ impl Profiles {
             let location = record["location"].clone();
             self.fingerprints.apply_location(&mut record["fingerprint"], &location)?;
         }
-        if string(&old,"os") != string(&record,"os") || old["fingerprint_meta"]["use_preset"] != record["fingerprint_meta"]["use_preset"] {
+        if string(&old,"os") != string(&record,"os")
+            || old["fingerprint_meta"]["use_preset"].as_bool().unwrap_or(false) != record["fingerprint_meta"]["use_preset"].as_bool().unwrap_or(false) {
             record["fingerprint"] = self.fingerprints.generate(&record)?;
             record["fingerprint_meta"]["regenerated_at"] = json!(utcnow());
         } else if old["browser_version"] != record["browser_version"] && !string(&record,"browser_version").is_empty() {
@@ -260,7 +261,7 @@ impl Profiles {
         let stage = tempfile::Builder::new().prefix(".addon-stage-").tempdir_in(&profile)?;
         let unpacked = stage.path().join("unpacked");
         if source.is_file() {
-            extract_zip(source, &unpacked, 100 * 1024 * 1024, None)?;
+            extract_zip(fs::File::open(source)?, &unpacked, 100 * 1024 * 1024, None)?;
         } else if source.is_dir() { copy_tree(source, &unpacked)?; }
         else { bail!("Nguồn extension không tồn tại"); }
         let root = if unpacked.join("manifest.json").is_file() { unpacked.clone() } else {

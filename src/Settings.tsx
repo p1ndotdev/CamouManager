@@ -46,6 +46,12 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
   const [autoAssignProxy, setAutoAssignProxy] = useState<boolean>(
     snapshot.settings?.auto_assign_proxy ?? false
   );
+  const [defaultStartupUrl, setDefaultStartupUrl] = useState<string>(
+    snapshot.settings?.default_startup_url || 'https://duckduckgo.com'
+  );
+  const [defaultSearchEngine, setDefaultSearchEngine] = useState<string>(
+    snapshot.settings?.default_search_engine || 'DuckDuckGo'
+  );
   const [savingSettings, setSavingSettings] = useState(false);
 
   // Sync settings when snapshot updates
@@ -62,6 +68,10 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
         setDefaultProxyId(snapshot.settings.default_proxy_id);
       if (snapshot.settings.auto_assign_proxy !== undefined)
         setAutoAssignProxy(snapshot.settings.auto_assign_proxy);
+      if (snapshot.settings.default_startup_url !== undefined)
+        setDefaultStartupUrl(snapshot.settings.default_startup_url || 'https://duckduckgo.com');
+      if (snapshot.settings.default_search_engine !== undefined)
+        setDefaultSearchEngine(snapshot.settings.default_search_engine || 'DuckDuckGo');
     }
   }, [snapshot.settings]);
 
@@ -295,6 +305,8 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
           auto_download_updates: autoDownloadUpdates,
           default_proxy_id: defaultProxyId,
           auto_assign_proxy: autoAssignProxy,
+          default_startup_url: defaultStartupUrl.trim(),
+          default_search_engine: defaultSearchEngine.trim(),
         },
       });
       await onRefresh();
@@ -427,39 +439,57 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
   const availableColumns: Column<Version>[] = useMemo(
     () => [
       {
+        key: 'select',
+        header: t('Chọn', 'Select'),
+        width: 60,
+        align: 'center',
+        render: (v, _index, selected) => {
+          const verId = v.id || v.name;
+          return (
+            <input
+              type="checkbox"
+              className="cm-checkbox"
+              checked={Boolean(selected)}
+              onChange={() => setSelectedAvailableId((prev) => (prev === verId ? null : verId))}
+              onClick={(e) => e.stopPropagation()}
+              aria-label={t(`Chọn phiên bản ${verId}`, `Select version ${verId}`)}
+              style={{ cursor: 'pointer', width: 16, height: 16 }}
+            />
+          );
+        },
+      },
+      {
         key: 'id',
         header: t('Phiên bản', 'Version'),
-        width: 140,
+        flex: 2,
         render: (v) => (
-          <span style={{ fontWeight: 600 }}>
-            {v.id || v.name}
-            {v.prerelease ? t(' (Bản thử nghiệm)', ' (Pre-release)') : ''}
-          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', minWidth: 0 }}>
+            <strong style={{ fontFamily: 'Consolas, monospace', fontSize: '13px' }}>
+              {v.id || v.name}
+            </strong>
+            {v.prerelease ? (
+              <span
+                className="cm-pill-counter"
+                style={{ fontSize: 10, background: 'rgba(237, 118, 58, 0.2)', color: '#ed763a' }}
+              >
+                {t('Thử nghiệm', 'Pre-release')}
+              </span>
+            ) : null}
+          </div>
         ),
       },
       {
         key: 'name',
         header: t('Tên bản phát hành', 'Release Name'),
-        flex: 2,
-        render: (v) => <span style={{ fontFamily: 'Consolas, monospace', fontSize: '12px' }}>{v.name}</span>,
+        flex: 1.5,
+        render: (v) => <span style={{ color: 'var(--text-secondary)', fontSize: '12px' }}>{v.name}</span>,
       },
       {
         key: 'size',
         header: t('Kích thước', 'Size'),
         width: 100,
-        render: (v) => <span>{v.size ? formatBytes(v.size) : '-'}</span>,
-      },
-      {
-        key: 'status',
-        header: t('Chọn phiên bản', 'Select Version'),
-        width: 110,
-        render: (v, _index, selected) => (
-          <Button variant="ghost" size="sm" aria-pressed={selected}
-            aria-label={t(`Chọn phiên bản ${v.id || v.name}`, `Select version ${v.id || v.name}`)}
-            onClick={() => setSelectedAvailableId(v.id || v.name)}>
-            {selected ? t('Đã chọn', 'Selected') : t('Chọn', 'Select')}
-          </Button>
-        ),
+        align: 'right',
+        render: (v) => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{v.size ? formatBytes(v.size) : '-'}</span>,
       },
     ],
     [t]
@@ -684,6 +714,10 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
                     rowHeight={40}
                     rowKey={(v) => v.id || v.name}
                     selectedKeys={selectedAvailableId ? new Set([selectedAvailableId]) : undefined}
+                    onRowClick={(v) => {
+                      const verId = v.id || v.name;
+                      setSelectedAvailableId((prev) => (prev === verId ? null : verId));
+                    }}
                   />
                 </div>
               )}
@@ -784,6 +818,44 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
                     />
                     {t('Tự động tải bản cập nhật khi phát hiện phiên bản mới', 'Automatically download updates when a new version is detected')}
                   </label>
+                </div>
+              </div>
+
+              {/* Group: Cấu hình mặc định trình duyệt */}
+              <div className="cm-card" style={{ marginBottom: '16px' }}>
+                <h2 className="cm-card-title">{t('Khởi động & Tìm kiếm mặc định', 'Startup & Default Search Engine')}</h2>
+
+                <Field
+                  label={t('Trang khởi động mặc định', 'Default Startup URL')}
+                  hint={t('Trang web mặc định mở khi tạo profile mới.', 'Default webpage opened when creating a new profile.')}
+                >
+                  <input
+                    type="text"
+                    className="cm-input"
+                    aria-label={t('Trang khởi động mặc định', 'Default Startup URL')}
+                    value={defaultStartupUrl}
+                    onChange={(e) => setDefaultStartupUrl(e.target.value)}
+                    placeholder="https://duckduckgo.com"
+                  />
+                </Field>
+
+                <div style={{ marginTop: '12px' }}>
+                  <Field
+                    label={t('Công cụ tìm kiếm mặc định', 'Default Search Engine')}
+                    hint={t('Công cụ tìm kiếm mặc định được gán cho profile mới.', 'Default search engine assigned to new profiles.')}
+                  >
+                    <select
+                      className="cm-select"
+                      style={{ minWidth: '220px' }}
+                      aria-label={t('Công cụ tìm kiếm mặc định', 'Default Search Engine')}
+                      value={defaultSearchEngine}
+                      onChange={(e) => setDefaultSearchEngine(e.target.value)}
+                    >
+                      <option value="DuckDuckGo">DuckDuckGo</option>
+                      <option value="Google">Google</option>
+                      <option value="Bing">Bing</option>
+                    </select>
+                  </Field>
                 </div>
               </div>
 

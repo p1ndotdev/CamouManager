@@ -20,6 +20,10 @@ Yêu cầu **Windows 10/11 x64** và **Microsoft Edge WebView2 Runtime**.
 
 Đổi Tiếng Việt / English tại **Cài đặt → Ngôn ngữ giao diện**. Lựa chọn được ghi nhớ, không thay đổi locale của fingerprint. Log và chi tiết lỗi kỹ thuật giữ nguyên ngôn ngữ gốc.
 
+### Cập nhật lên v1.0.4
+
+Bản v1.0.4 đồng bộ kích thước cửa sổ và màn hình ảo (`screen.width/height`), tự động nhận diện màn hình máy thật (`host_work_area`) để mở cửa sổ vừa vặn và căn giữa; mở khóa co giãn giao diện web responsive khi kéo thả viền cửa sổ. Bổ sung tùy chọn độ phân giải màn hình tùy chỉnh hoặc ngẫu nhiên, cảnh báo lệch vị trí Proxy kèm nút đồng bộ 1 chạm, mặc định mở và tìm kiếm bằng DuckDuckGo (có thể cấu hình trong Cài đặt và từng hồ sơ), tối ưu chuẩn hóa CPU theo số luồng máy thật (chuẩn Windows Task Manager), cải tiến giao diện chọn phiên bản và nút thao tác danh sách hồ sơ.
+
 ### Cập nhật lên v1.0.3
 
 Bản v1.0.3 cài tiện ích monitor IP qua phiên BiDi đã xác minh PID và chờ kết quả cài trước khi kiểm tra IP; không còn giao riêng monitor cho luồng cài tiện ích ngầm của Camoufox. Lỗi cài tiện ích được báo trực tiếp. Vẫn yêu cầu nhận IP hợp lệ trước khi công bố profile chạy thành công, giữ nguyên timeout kiểm tra IP 20 giây và chính sách proxy/WebRTC. Bỏ cách xóa cache WebExtension của v1.0.2; không xóa cookie, phiên đăng nhập, fingerprint hay cache của profile. Không đổi schema hoặc thư mục dữ liệu. Bản v1.0.1 trước đó sửa nhận diện BiDi `localhost` với SOCKS5 remote DNS.

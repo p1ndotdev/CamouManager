@@ -54,8 +54,8 @@ fn extension_identity(manifest: &Value) -> Result<&str> {
 
 fn validate_profile_schema(data: &Value, current: Option<&Value>) -> Result<Value> {
     let obj = data.as_object().ok_or_else(|| anyhow!("Dữ liệu hồ sơ phải là object"))?;
-    let mut record = current.cloned().unwrap_or_else(|| json!({"name":"", "group":"", "tags":[], "note":"", "browser_version":"", "os":"windows", "location":{}, "startup_urls":[], "bookmarks":[], "extensions":[], "fingerprint_meta":{}}));
-    for key in ["name", "group", "note", "browser_version", "os", "proxy_id"] {
+    let mut record = current.cloned().unwrap_or_else(|| json!({"name":"", "group":"", "tags":[], "note":"", "browser_version":"", "os":"windows", "search_engine":"", "location":{}, "startup_urls":[], "bookmarks":[], "extensions":[], "fingerprint_meta":{}}));
+    for key in ["name", "group", "note", "browser_version", "os", "proxy_id", "search_engine"] {
         if let Some(v) = obj.get(key) { record[key] = json!(v.as_str().ok_or_else(|| anyhow!("'{key}' phải là chuỗi"))?.trim()); }
     }
     let name = require_str(&record, "name")?;
@@ -80,8 +80,23 @@ fn validate_profile_schema(data: &Value, current: Option<&Value>) -> Result<Valu
         for path in &extensions { extension_path(path)?; }
         record["extensions"] = json!(extensions);
     }
-    for key in ["fingerprint", "fingerprint_meta"] {
-        if let Some(v) = obj.get(key) { if !v.is_object() { bail!("'{key}' phải là object"); } record[key] = v.clone(); }
+    if let Some(v) = obj.get("fingerprint") {
+        if !v.is_object() {
+            bail!("'fingerprint' phải là object");
+        }
+        record["fingerprint"] = v.clone();
+    }
+    if let Some(v) = obj.get("fingerprint_meta") {
+        let meta_obj = v
+            .as_object()
+            .ok_or_else(|| anyhow!("'fingerprint_meta' phải là object"))?;
+        if let Some(curr_meta) = record.get_mut("fingerprint_meta").and_then(Value::as_object_mut) {
+            for (k, val) in meta_obj {
+                curr_meta.insert(k.clone(), val.clone());
+            }
+        } else {
+            record["fingerprint_meta"] = v.clone();
+        }
     }
     Ok(record)
 }
@@ -186,7 +201,8 @@ impl Profiles {
             self.fingerprints.apply_location(&mut record["fingerprint"], &location)?;
         }
         if string(&old,"os") != string(&record,"os")
-            || old["fingerprint_meta"]["use_preset"].as_bool().unwrap_or(false) != record["fingerprint_meta"]["use_preset"].as_bool().unwrap_or(false) {
+            || old["fingerprint_meta"]["use_preset"].as_bool().unwrap_or(false) != record["fingerprint_meta"]["use_preset"].as_bool().unwrap_or(false)
+            || string(&old["fingerprint_meta"], "screen") != string(&record["fingerprint_meta"], "screen") {
             record["fingerprint"] = self.fingerprints.generate(&record)?;
             record["fingerprint_meta"]["regenerated_at"] = json!(utcnow());
         } else if old["browser_version"] != record["browser_version"] && !string(&record,"browser_version").is_empty() {
@@ -361,5 +377,84 @@ mod tests {
         assert!(validate_url("javascript://alert(1)").is_err());
         assert!(validate_url("").is_err());
         assert_eq!(browser_major("v156.0.1-beta.36").unwrap(),156);
+    }
+
+    #[test]
+    fn update_regenerates_fingerprint_when_screen_resolution_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let network = Arc::new(Network::new(store.clone()));
+        let fingerprints = Arc::new(FingerprintService::new(store.clone()).unwrap());
+        let runtime = Arc::new(Runtime::new(store.clone(), network.clone(), fingerprints.clone()));
+        let profiles = Profiles::new(store.clone(), runtime.clone(), network.clone(), fingerprints.clone());
+
+        let created = profiles.create(json!({
+            "name": "Screen Test",
+            "os": "windows",
+            "fingerprint_meta": { "screen": "1920x1080" }
+        })).unwrap();
+        let id = created["id"].as_str().unwrap();
+        assert_eq!(created["fingerprint"]["screen.width"], 1920);
+        assert_eq!(created["fingerprint"]["screen.height"], 1080);
+
+        let updated = profiles.update(id, json!({
+            "fingerprint_meta": { "screen": "1366x768" }
+        })).unwrap();
+        assert_eq!(updated["fingerprint"]["screen.width"], 1366);
+        assert_eq!(updated["fingerprint"]["screen.height"], 768);
+        assert_eq!(updated["fingerprint_meta"]["screen"], "1366x768");
+        assert!(updated["fingerprint_meta"]["regenerated_at"].is_string());
+    }
+
+    #[test]
+    fn update_preserves_legacy_profile_fingerprint_without_screen() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let network = Arc::new(Network::new(store.clone()));
+        let fingerprints = Arc::new(FingerprintService::new(store.clone()).unwrap());
+        let runtime = Arc::new(Runtime::new(store.clone(), network.clone(), fingerprints.clone()));
+        let profiles = Profiles::new(store, runtime, network, fingerprints);
+
+        let created = profiles.create(json!({
+            "name": "Legacy Profile",
+            "os": "windows",
+            "fingerprint_meta": { "use_preset": true }
+        })).unwrap();
+        let id = created["id"].as_str().unwrap();
+        assert!(created["fingerprint_meta"].get("screen").is_none());
+        let orig_fp = created["fingerprint"].clone();
+
+        let updated = profiles.update(id, json!({
+            "name": "Renamed Legacy Profile",
+            "tags": ["work"],
+            "fingerprint_meta": { "use_preset": true, "screen": "" }
+        })).unwrap();
+
+        assert_eq!(updated["name"], "Renamed Legacy Profile");
+        assert_eq!(updated["fingerprint"], orig_fp);
+        assert!(updated["fingerprint_meta"].get("regenerated_at").is_none());
+    }
+
+    #[test]
+    fn profile_accepts_and_preserves_search_engine() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(temp.path()).unwrap());
+        let network = Arc::new(Network::new(store.clone()));
+        let fingerprints = Arc::new(FingerprintService::new(store.clone()).unwrap());
+        let runtime = Arc::new(Runtime::new(store.clone(), network.clone(), fingerprints.clone()));
+        let profiles = Profiles::new(store, runtime, network, fingerprints);
+
+        let created = profiles.create(json!({
+            "name": "DuckDuckGo Profile",
+            "os": "windows",
+            "search_engine": "DuckDuckGo"
+        })).unwrap();
+        assert_eq!(created["search_engine"], "DuckDuckGo");
+
+        let id = created["id"].as_str().unwrap();
+        let updated = profiles.update(id, json!({
+            "search_engine": "Google"
+        })).unwrap();
+        assert_eq!(updated["search_engine"], "Google");
     }
 }

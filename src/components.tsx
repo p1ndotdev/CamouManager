@@ -245,6 +245,7 @@ export interface VirtualTableProps<T> {
   empty?: React.ReactNode;
   onRowDoubleClick?: (row: T) => void;
   onRowContextMenu?: (row: T, event: React.MouseEvent) => void;
+  onRowClick?: (row: T) => void;
   selectedKeys?: ReadonlySet<string>;
 }
 
@@ -257,6 +258,7 @@ interface VirtualRowProps<T> {
   selected: boolean;
   onRowDoubleClick?: (row: T) => void;
   onRowContextMenu?: (row: T, event: React.MouseEvent) => void;
+  onRowClick?: (row: T) => void;
 }
 
 const VirtualRowInner = <T,>({
@@ -268,6 +270,7 @@ const VirtualRowInner = <T,>({
   selected,
   onRowDoubleClick,
   onRowContextMenu,
+  onRowClick,
 }: VirtualRowProps<T>) => {
   return (
     <div
@@ -279,6 +282,7 @@ const VirtualRowInner = <T,>({
         transform: `translateY(${top}px)`,
       }}
       onDoubleClick={onRowDoubleClick ? () => onRowDoubleClick(row) : undefined}
+      onClick={onRowClick ? () => onRowClick(row) : undefined}
       onContextMenu={onRowContextMenu ? (e) => onRowContextMenu(row, e) : undefined}
     >
       {columns.map((col) => {
@@ -311,6 +315,7 @@ export function VirtualTable<T>({
   onRowDoubleClick,
   onRowContextMenu,
   selectedKeys,
+  onRowClick,
 }: VirtualTableProps<T>) {
   const { t } = useI18n();
   const items = rows ?? data ?? [];
@@ -411,6 +416,7 @@ export function VirtualTable<T>({
                   selected={selected}
                   onRowDoubleClick={onRowDoubleClick}
                   onRowContextMenu={onRowContextMenu}
+                  onRowClick={onRowClick}
                 />
               );
             })}

@@ -35,8 +35,10 @@ export default function ProfileEditor({
   const [tagsText, setTagsText] = useState('');
   const [os, setOs] = useState('windows');
   const [browserVersion, setBrowserVersion] = useState('');
+  const [screenResolution, setScreenResolution] = useState('');
   const [usePreset, setUsePreset] = useState(true);
   const [note, setNote] = useState('');
+  const [searchEngine, setSearchEngine] = useState('');
   const [versionNotice, setVersionNotice] = useState(false);
   const [presetNotice, setPresetNotice] = useState(false);
 
@@ -76,8 +78,10 @@ export default function ProfileEditor({
     setTagsText((p.tags || []).join(', '));
     setOs(p.os || 'windows');
     setBrowserVersion(p.browser_version || '');
+    setScreenResolution(p.fingerprint_meta?.screen || '');
     setUsePreset(Boolean(p.fingerprint_meta?.use_preset));
     setNote(p.note || '');
+    setSearchEngine(p.search_engine || '');
     setVersionNotice(false);
     setPresetNotice(false);
 
@@ -100,7 +104,10 @@ export default function ProfileEditor({
     setLocLocked(Boolean(loc.locked));
 
     setStartupUrls([...(p.startup_urls || [])]);
+    setNewStartupUrl('');
     setBookmarks((p.bookmarks || []).map((b) => ({ title: b.title || '', url: b.url || '' })));
+    setNewBmTitle('');
+    setNewBmUrl('');
     setExtensions([...(p.extensions || [])]);
   };
 
@@ -114,8 +121,10 @@ export default function ProfileEditor({
       setTagsText('');
       setOs('windows');
       setBrowserVersion('');
+      setScreenResolution('');
       setUsePreset(true);
       setNote('');
+      setSearchEngine('');
       setVersionNotice(false);
       setPresetNotice(false);
       setProxyMode('default');
@@ -128,7 +137,7 @@ export default function ProfileEditor({
       setLocLat('');
       setLocLng('');
       setLocLocked(false);
-      setStartupUrls([]);
+      setStartupUrls([snapshot.settings?.default_startup_url || 'https://duckduckgo.com']);
       setNewStartupUrl('');
       setBookmarks([]);
       setNewBmTitle('');
@@ -191,6 +200,50 @@ export default function ProfileEditor({
     return '';
   };
 
+  const effectiveProxyId = resolveEffectiveProxyId();
+  const proxy = effectiveProxyId ? snapshot.proxies.find((p) => p.id === effectiveProxyId) : null;
+  const isProxyMismatch = Boolean(
+    effectiveProxyId &&
+      proxy?.last_check?.country &&
+      locCountry &&
+      proxy.last_check.country.trim().toUpperCase() !== locCountry.trim().toUpperCase()
+  );
+
+  const handleSyncProxyWithLocation = () => {
+    if (!proxy?.last_check?.country) return;
+    setLocCountry(proxy.last_check.country.toUpperCase());
+    if (proxy.last_check.ip) {
+      setLocIp(proxy.last_check.ip);
+    }
+  };
+
+  const renderProxyMismatchWarning = () => {
+    if (!isProxyMismatch || !proxy?.last_check?.country) return null;
+    return (
+      <div
+        className="cm-banner cm-banner-warning cm-row"
+        style={{
+          marginTop: 8,
+          marginBottom: 12,
+          justifyContent: 'space-between',
+          alignItems: 'center',
+          flexWrap: 'wrap',
+          gap: 8,
+        }}
+      >
+        <span>
+          {t(
+            `⚠️ Quốc gia proxy (${proxy.last_check.country.toUpperCase()}) khác với vị trí hồ sơ (${locCountry.toUpperCase()}).`,
+            `⚠️ Proxy country (${proxy.last_check.country.toUpperCase()}) differs from profile location (${locCountry.toUpperCase()}).`
+          )}
+        </span>
+        <Button variant="secondary" size="sm" onClick={handleSyncProxyWithLocation}>
+          {t('Đồng bộ theo Proxy', 'Sync with Proxy')}
+        </Button>
+      </div>
+    );
+  };
+
   const buildPayload = (): Record<string, unknown> | null => {
     const cleanName = name.trim();
     if (!cleanName) {
@@ -249,6 +302,7 @@ export default function ProfileEditor({
     const meta = {
       ...(savedProfile?.fingerprint_meta || {}),
       use_preset: usePreset,
+      screen: screenResolution,
     };
 
     const payload: Record<string, unknown> = {
@@ -258,6 +312,7 @@ export default function ProfileEditor({
       note: note.trim(),
       os,
       browser_version: browserVersion,
+      search_engine: searchEngine.trim(),
       proxy_id: proxyParam,
       location: {
         ip: locIp.trim(),
@@ -564,6 +619,35 @@ export default function ProfileEditor({
             </div>
           ) : null}
 
+          <Field label={t('Độ phân giải màn hình:', 'Screen Resolution:')} htmlFor="profile-screen-resolution">
+            <select
+              id="profile-screen-resolution"
+              value={screenResolution}
+              onChange={(e) => setScreenResolution(e.target.value)}
+            >
+              <option value="">{t('Mặc định (Ngẫu nhiên)', 'Default (Random)')}</option>
+              <option value="1920x1080">1920 × 1080 (FHD)</option>
+              <option value="1366x768">1366 × 768 (Laptop)</option>
+              <option value="1536x864">1536 × 864</option>
+              <option value="1440x900">1440 × 900 (MacBook)</option>
+              <option value="1600x900">1600 × 900</option>
+              <option value="2560x1440">2560 × 1440 (2K QHD)</option>
+            </select>
+          </Field>
+
+          <Field label={t('Công cụ tìm kiếm:', 'Search Engine:')} htmlFor="profile-search-engine">
+            <select id="profile-search-engine" value={searchEngine} onChange={(e) => setSearchEngine(e.target.value)}>
+              <option value="">
+                {t(
+                  `Mặc định hệ thống (${snapshot.settings?.default_search_engine || 'DuckDuckGo'})`,
+                  `System default (${snapshot.settings?.default_search_engine || 'DuckDuckGo'})`
+                )}
+              </option>
+              <option value="DuckDuckGo">DuckDuckGo</option>
+              <option value="Google">Google</option>
+              <option value="Bing">Bing</option>
+            </select>
+          </Field>
           <div className="cm-field">
             <label className="cm-row" style={{ cursor: 'pointer', fontWeight: 500 }}>
               <input
@@ -649,6 +733,8 @@ export default function ProfileEditor({
               {t(proxyTestResult.vi, proxyTestResult.en)}
             </div>
           ) : null}
+
+          {renderProxyMismatchWarning()}
         </div>
       ) : null}
 
@@ -667,6 +753,8 @@ export default function ProfileEditor({
               <span>{t('Khóa thông tin vị trí (Không tự động thay đổi)', 'Lock location info (Do not auto-update)')}</span>
             </label>
           </div>
+
+          {renderProxyMismatchWarning()}
 
           <div className="cm-grid-2">
             <Field label={t('Địa chỉ IP:', 'IP Address:')} htmlFor="loc-ip">

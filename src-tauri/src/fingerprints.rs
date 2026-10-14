@@ -723,6 +723,75 @@ pub fn fix_screen_no_taskbar(config: &mut Map<String, Value>, os_short: &str) {
     }
 }
 
+pub fn ensure_window_dimensions(config: &mut Map<String, Value>) {
+    let sw = config
+        .get("screen.width")
+        .and_then(Value::as_i64)
+        .filter(|&v| v > 0)
+        .unwrap_or(1920);
+    let sh = config
+        .get("screen.height")
+        .and_then(Value::as_i64)
+        .filter(|&v| v > 0)
+        .unwrap_or(1080);
+    let aw = config
+        .get("screen.availWidth")
+        .and_then(Value::as_i64)
+        .filter(|&v| v > 0)
+        .unwrap_or(sw);
+    let ah = config
+        .get("screen.availHeight")
+        .and_then(Value::as_i64)
+        .filter(|&v| v > 0)
+        .unwrap_or(sh);
+
+    if !config.contains_key("screen.availWidth") {
+        config.insert("screen.availWidth".into(), json!(aw));
+    }
+    if !config.contains_key("screen.availHeight") {
+        config.insert("screen.availHeight".into(), json!(ah));
+    }
+
+    let outer_w = config
+        .get("window.outerWidth")
+        .and_then(Value::as_i64)
+        .filter(|&v| v > 0)
+        .unwrap_or(aw)
+        .min(aw);
+    let outer_h = config
+        .get("window.outerHeight")
+        .and_then(Value::as_i64)
+        .filter(|&v| v > 0)
+        .unwrap_or(ah)
+        .min(ah);
+
+    config.insert("window.outerWidth".into(), json!(outer_w));
+    config.insert("window.outerHeight".into(), json!(outer_h));
+
+    let inner_w = config
+        .get("window.innerWidth")
+        .and_then(Value::as_i64)
+        .filter(|&v| v > 0)
+        .unwrap_or(outer_w)
+        .min(outer_w);
+    let inner_h = config
+        .get("window.innerHeight")
+        .and_then(Value::as_i64)
+        .filter(|&v| v > 0)
+        .unwrap_or_else(|| (outer_h - BROWSER_CHROME_HEIGHT).max(1))
+        .min((outer_h - BROWSER_CHROME_HEIGHT).max(1));
+
+    config.insert("window.innerWidth".into(), json!(inner_w));
+    config.insert("window.innerHeight".into(), json!(inner_h));
+
+    if !config.contains_key("window.screenX") {
+        config.insert("window.screenX".into(), json!(0));
+    }
+    if !config.contains_key("window.screenY") {
+        config.insert("window.screenY".into(), json!(0));
+    }
+}
+
 pub fn clamp_window_dimensions(config: &mut Map<String, Value>) {
     for (screen_k, avail_k, outer_k, inner_k) in [
         (
@@ -1626,6 +1695,23 @@ pub fn validate_coherence(config: &Map<String, Value>, os_short: &str) -> Vec<(S
 }
 
 pub fn apply_coherence(config: &mut Map<String, Value>, os_short: &str) -> Vec<(String, String)> {
+    let renderer = config
+        .get("webGl:renderer")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    if !renderer.is_empty() && !gpu_fits_os(&renderer, os_short) {
+        let width = config.get("screen.width").and_then(Value::as_i64);
+        let height = config.get("screen.height").and_then(Value::as_i64);
+        let cores = config.get("navigator.hardwareConcurrency").and_then(Value::as_i64);
+        let seed = identity_seed_from_config(config);
+        if let Ok(webgl_fp) = sample_webgl_for_screen(os_short, width, height, seed, cores) {
+            config.extend(webgl_fp);
+        }
+    }
+    ensure_window_dimensions(config);
+    clamp_window_dimensions(config);
+    clamp_window_position(config);
     let is_apple_silicon = config
         .get("webGl:renderer")
         .and_then(Value::as_str)
@@ -1897,7 +1983,33 @@ fn sha256_hex(raw: &[u8]) -> String {
     hex::encode(Sha256::digest(raw))
 }
 
-fn sample_bundled_preset(target_os: &str, major: u32) -> Option<Value> {
+pub fn parse_screen_resolution(raw: &str) -> Option<(i64, i64)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (w_str, h_str) = raw.split_once(['x', 'X', '×', '*'])?;
+    let w = w_str.trim().parse::<i64>().ok()?;
+    let h = h_str.trim().parse::<i64>().ok()?;
+    if w > 0 && h > 0 {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
+fn preset_matches_screen(preset: &Value, w: i64, h: i64) -> bool {
+    preset.get("screen").is_some_and(|s| {
+        s.get("width").and_then(Value::as_i64) == Some(w)
+            && s.get("height").and_then(Value::as_i64) == Some(h)
+    })
+}
+
+fn sample_bundled_preset(
+    target_os: &str,
+    major: u32,
+    target_res: Option<(i64, i64)>,
+) -> Option<Value> {
     let catalogs = &*CATALOGS;
     let dataset = if major >= PRESETS_V150_MIN_FF {
         &catalogs.presets_v150
@@ -1909,6 +2021,15 @@ fn sample_bundled_preset(target_os: &str, major: u32) -> Option<Value> {
         .and_then(|p| p.get(target_os))
         .and_then(Value::as_array)?;
     let mut rng = rand::thread_rng();
+    if let Some((w, h)) = target_res {
+        let matching: Vec<&Value> = candidates
+            .iter()
+            .filter(|p| preset_matches_screen(p, w, h))
+            .collect();
+        if let Some(chosen) = matching.choose(&mut rng) {
+            return Some((*chosen).clone());
+        }
+    }
     candidates.choose(&mut rng).cloned()
 }
 
@@ -1991,6 +2112,10 @@ impl FingerprintService {
     pub fn generate(&self, profile: &Value) -> Result<Value> {
         let (target_os, os_short) = resolve_os_pair(profile.get("os").and_then(Value::as_str))?;
         let (major, exe_path) = self.resolve_version_and_path(profile);
+        let requested_screen = profile
+            .pointer("/fingerprint_meta/screen")
+            .and_then(Value::as_str);
+        let target_res = requested_screen.and_then(parse_screen_resolution);
         let use_preset = profile
             .pointer("/fingerprint_meta/use_preset")
             .and_then(Value::as_bool)
@@ -2000,10 +2125,12 @@ impl FingerprintService {
         let mut config = Map::new();
 
         if use_preset {
-            let preset = if let Some(sampled) = self.sample_downloaded_preset(target_os, major)? {
+            let preset = if let Some(sampled) =
+                self.sample_downloaded_preset_matching(target_os, major, target_res)?
+            {
                 Some(sampled)
             } else {
-                sample_bundled_preset(target_os, major)
+                sample_bundled_preset(target_os, major, target_res)
             };
             if let Some(p) = preset {
                 config = from_preset(&p, major);
@@ -2018,11 +2145,26 @@ impl FingerprintService {
         repair_screen_orientation(&mut config);
         fix_navigator_arch(&mut config, os_short);
         fix_hardware_concurrency(&mut config);
-        raise_screen_to_modern_floor(&mut config);
+        if let Some((w, h)) = target_res {
+            config.insert("screen.width".into(), json!(w));
+            config.insert("screen.height".into(), json!(h));
+            for key in [
+                "screen.availWidth",
+                "screen.availHeight",
+                "window.outerWidth",
+                "window.outerHeight",
+                "window.innerWidth",
+                "window.innerHeight",
+            ] {
+                config.remove(key);
+            }
+        } else {
+            raise_screen_to_modern_floor(&mut config);
+        }
         fix_screen_no_taskbar(&mut config, os_short);
+        ensure_window_dimensions(&mut config);
         clamp_window_dimensions(&mut config);
         clamp_window_position(&mut config);
-
         let base_seed = compute_initial_seed(&config, salt);
         let audio_seed =
             (((base_seed.wrapping_mul(2654435761).wrapping_add(97)) & 0xFFFF_FFFF) as u32).max(1);
@@ -2076,6 +2218,9 @@ impl FingerprintService {
 
         let mut config_val = Value::Object(config);
         self.apply_location(&mut config_val, loc_obj)?;
+        if let Some(ua) = config_val.get("navigator.userAgent").and_then(Value::as_str) {
+            config_val["headers.User-Agent"] = json!(ua);
+        }
         sanitize_for_browser(&mut config_val, exe_path.as_deref())?;
 
         let _ = self.store.log(
@@ -2152,11 +2297,22 @@ impl FingerprintService {
 
         fp.insert("locale:language".into(), json!(lang));
         fp.insert("locale:region".into(), json!(region));
-        if let Some(script) = script_opt {
+        if let Some(script) = &script_opt {
             fp.insert("locale:script".into(), json!(script));
         } else {
             fp.remove("locale:script");
         }
+        let full_locale = if let Some(script) = &script_opt {
+            format!("{lang}-{script}-{region}")
+        } else {
+            format!("{lang}-{region}")
+        };
+        let accept_languages = if lang == "en" {
+            format!("{full_locale},en;q=0.5")
+        } else {
+            format!("{full_locale},{lang};q=0.9,en-US;q=0.8,en;q=0.7")
+        };
+        fp.insert("headers.Accept-Language".into(), json!(accept_languages));
 
         if let Some(tz_val) = location.get("timezone") {
             if tz_val.is_null() {
@@ -2272,6 +2428,15 @@ impl FingerprintService {
     }
 
     pub fn sample_downloaded_preset(&self, target_os: &str, major: u32) -> Result<Option<Value>> {
+        self.sample_downloaded_preset_matching(target_os, major, None)
+    }
+
+    pub fn sample_downloaded_preset_matching(
+        &self,
+        target_os: &str,
+        major: u32,
+        target_res: Option<(i64, i64)>,
+    ) -> Result<Option<Value>> {
         let _guard = self.lock.lock();
         let metadata = self.info()?;
         let snapshot = string(&metadata, "snapshot");
@@ -2327,6 +2492,15 @@ impl FingerprintService {
                 .filter(|c| !c.is_empty())
             {
                 let mut rng = rand::thread_rng();
+                if let Some((w, h)) = target_res {
+                    let matching: Vec<&Value> = candidates
+                        .iter()
+                        .filter(|p| preset_matches_screen(p, w, h))
+                        .collect();
+                    if let Some(chosen) = matching.choose(&mut rng) {
+                        return Ok(Some((*chosen).clone()));
+                    }
+                }
                 return Ok(candidates.choose(&mut rng).cloned());
             }
         }
@@ -3154,5 +3328,92 @@ mod tests {
             let c = from_preset(&p, 150);
             assert!(c.get("window.devicePixelRatio").is_none());
         }
+    }
+
+    #[test]
+    fn window_dimensions_headers_and_gpu_coherence_are_enforced() {
+        let mut cfg = Map::new();
+        cfg.insert("screen.width".into(), json!(1366));
+        cfg.insert("screen.height".into(), json!(768));
+        ensure_window_dimensions(&mut cfg);
+        clamp_window_dimensions(&mut cfg);
+
+        let outer_w = cfg["window.outerWidth"].as_i64().unwrap();
+        let outer_h = cfg["window.outerHeight"].as_i64().unwrap();
+        let inner_w = cfg["window.innerWidth"].as_i64().unwrap();
+        let inner_h = cfg["window.innerHeight"].as_i64().unwrap();
+        assert!(inner_w <= outer_w);
+        assert!(outer_w <= 1366);
+        assert!(inner_h <= outer_h);
+        assert!(outer_h <= 768);
+        assert!(outer_h - inner_h >= BROWSER_CHROME_HEIGHT);
+
+        let (_dir, _store, service) = test_service();
+        let mut fp = json!({});
+        service
+            .apply_location(
+                &mut fp,
+                &json!({
+                    "locale": "vi-VN",
+                    "timezone": "Asia/Ho_Chi_Minh",
+                    "country": "VN"
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            fp["headers.Accept-Language"],
+            json!("vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7")
+        );
+
+        let mut lin_cfg = Map::new();
+        lin_cfg.insert("screen.width".into(), json!(1920));
+        lin_cfg.insert("screen.height".into(), json!(1080));
+        lin_cfg.insert(
+            "webGl:renderer".into(),
+            json!("ANGLE (Intel, Intel(R) HD Graphics 400 Direct3D11 vs_5_0 ps_5_0), or similar"),
+        );
+        apply_coherence(&mut lin_cfg, "lin");
+        let fixed_renderer = lin_cfg["webGl:renderer"].as_str().unwrap();
+        assert!(
+            gpu_fits_os(fixed_renderer, "lin"),
+            "GPU renderer must be sanitized to fit Linux: {fixed_renderer}"
+        );
+    }
+
+    #[test]
+    fn generate_honors_explicit_screen_resolution() {
+        let (_dir, _store, service) = test_service();
+        let profile = json!({
+            "name": "explicit-screen",
+            "os": "windows",
+            "browser_version": "v156.0.1-beta.36",
+            "fingerprint_meta": { "screen": "1920x1080" },
+        });
+        let fp = service.generate(&profile).unwrap();
+        validate_config(&fp, None).unwrap();
+
+        let map = fp.as_object().unwrap();
+        assert_eq!(map["screen.width"].as_i64(), Some(1920));
+        assert_eq!(map["screen.height"].as_i64(), Some(1080));
+        let aw = map["screen.availWidth"].as_i64().unwrap();
+        let ah = map["screen.availHeight"].as_i64().unwrap();
+        assert_eq!(aw, 1920);
+        assert!(ah < 1080);
+        let ow = map["window.outerWidth"].as_i64().unwrap();
+        let oh = map["window.outerHeight"].as_i64().unwrap();
+        assert!(ow <= aw && oh <= ah);
+        let iw = map["window.innerWidth"].as_i64().unwrap();
+        let ih = map["window.innerHeight"].as_i64().unwrap();
+        assert!(iw <= ow && ih <= oh);
+    }
+
+    #[test]
+    fn parse_screen_resolution_handles_valid_and_invalid_formats() {
+        assert_eq!(parse_screen_resolution("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_screen_resolution("1366X768"), Some((1366, 768)));
+        assert_eq!(parse_screen_resolution(" 2560 x 1440 "), Some((2560, 1440)));
+        assert_eq!(parse_screen_resolution(""), None);
+        assert_eq!(parse_screen_resolution("invalid"), None);
+        assert_eq!(parse_screen_resolution("0x1080"), None);
     }
 }

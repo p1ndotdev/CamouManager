@@ -78,6 +78,78 @@ pub fn normalize_and_validate_url(raw: &str) -> Result<String> {
     Ok(parsed.into())
 }
 
+/// Query the host OS display work area dimensions (width, height in pixels).
+/// On Windows, queries SPI_GETWORKAREA, falling back to screen metrics minus taskbar.
+/// On non-Windows platforms, defaults to (1920, 1040).
+pub fn host_work_area() -> (i64, i64) {
+    #[cfg(windows)]
+    {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::{
+            Foundation::RECT,
+            UI::WindowsAndMessaging::{
+                GetSystemMetrics, SystemParametersInfoW, SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA,
+            },
+        };
+
+        let mut rect = MaybeUninit::<RECT>::uninit();
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                rect.as_mut_ptr() as *mut _,
+                0,
+            )
+        };
+        if ok != 0 {
+            let r = unsafe { rect.assume_init() };
+            let w = (r.right - r.left) as i64;
+            let h = (r.bottom - r.top) as i64;
+            if w > 0 && h > 0 {
+                return (w, h);
+            }
+        }
+
+        let cx = unsafe { GetSystemMetrics(SM_CXSCREEN) } as i64;
+        let cy = unsafe { GetSystemMetrics(SM_CYSCREEN) } as i64;
+        if cx > 0 && cy > 0 {
+            return (cx, (cy - 40).max(0));
+        }
+    }
+
+    (1920, 1040)
+}
+
+/// Adjust spoofed window dimensions if screen exceeds host work area,
+/// and remove innerWidth/innerHeight to let Gecko reflow responsively.
+pub fn adapt_window_to_host(config_map: &mut Map<String, Value>, host_w: i64, host_h: i64) {
+    let screen_w = config_map
+        .get("screen.width")
+        .and_then(Value::as_i64)
+        .unwrap_or(1920);
+    let avail_h = config_map
+        .get("screen.availHeight")
+        .and_then(Value::as_i64)
+        .or_else(|| config_map.get("screen.height").and_then(Value::as_i64))
+        .unwrap_or(1040);
+
+    if screen_w > host_w || avail_h > host_h {
+        let launch_w = (host_w - 40).min(screen_w).max(800);
+        let launch_h = (host_h - 60).min(avail_h).max(600);
+        config_map.insert("window.outerWidth".into(), json!(launch_w));
+        config_map.insert("window.outerHeight".into(), json!(launch_h));
+        config_map.insert("window.screenX".into(), json!(((screen_w - launch_w) / 2).max(0)));
+        config_map.insert("window.screenY".into(), json!(((avail_h - launch_h) / 2).max(0)));
+    }
+
+    // Remove window.innerWidth and window.innerHeight from config_map:
+    // By removing them from config_map before encoding CAMOU_CONFIG, Camoufox does NOT lock
+    // the DOM viewport to a fixed size, allowing Gecko to dynamically calculate innerWidth/innerHeight
+    // so responsive web layouts naturally reflow and adapt when the user drags/resizes the window.
+    config_map.remove("window.innerWidth");
+    config_map.remove("window.innerHeight");
+}
+
 /// Serialize a JSON value to compact ASCII-only JSON (`\uXXXX` for non-ASCII).
 /// Guarantees 1 byte per character so chunking never splits UTF-8 codepoints and
 /// Windows ANSI `getenv()` in `camoufox.cfg` / `MaskConfig` never corrupts non-ASCII text.
@@ -278,6 +350,8 @@ pub fn build_default_prefs(
     config: &Map<String, Value>,
     proxy_prefs: Option<&Value>,
     has_bookmarks: bool,
+    search_engine: Option<&str>,
+    startup_homepage: Option<&str>,
 ) -> Map<String, Value> {
     let mut prefs = Map::new();
     let target_os = infer_target_os(config);
@@ -358,6 +432,11 @@ pub fn build_default_prefs(
         None => "en-US".to_owned(),
     };
     prefs.insert("intl.locale.requested".into(), json!(requested_locale));
+    let accept_langs = config
+        .get("headers.Accept-Language")
+        .and_then(Value::as_str)
+        .unwrap_or("en-US,en;q=0.5");
+    prefs.insert("intl.accept_languages".into(), json!(accept_langs));
 
     prefs.insert("permissions.default.image".into(), json!(1));
     // Force proxy routing even on about:blank; relay candidates must be real, not spoofed.
@@ -405,7 +484,133 @@ pub fn build_default_prefs(
         prefs.insert("network.proxy.socks_port".into(), json!(0));
     }
 
+    let search_engine = search_engine
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("DuckDuckGo");
+    let startup_homepage = startup_homepage
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("https://duckduckgo.com");
+
+    prefs.insert("browser.search.defaultenginename".into(), json!(search_engine));
+    prefs.insert("browser.search.order.1".into(), json!(search_engine));
+    prefs.insert("browser.search.suggest.enabled".into(), json!(true));
+    prefs.insert("browser.startup.homepage".into(), json!(startup_homepage));
+
     prefs
+}
+
+pub fn resolve_search_engine(profile: Option<&Value>, settings: Option<&Value>) -> String {
+    profile
+        .and_then(|p| p.get("search_engine"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            settings
+                .and_then(|s| s.get("default_search_engine"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("DuckDuckGo")
+        .to_string()
+}
+
+pub fn resolve_default_startup_url(profile: Option<&Value>, settings: Option<&Value>) -> String {
+    fn check_url(candidate: &str) -> Option<&str> {
+        match normalize_and_validate_url(candidate) {
+            Ok(_) => Some(candidate),
+            Err(e) => {
+                eprintln!("Warning: Invalid default startup URL '{candidate}': {e}; falling back to https://duckduckgo.com");
+                None
+            }
+        }
+    }
+
+    profile
+        .and_then(|p| p.get("default_startup_url").or_else(|| p.get("startup_url")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(check_url)
+        .or_else(|| {
+            settings
+                .and_then(|s| s.get("default_startup_url"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(check_url)
+        })
+        .unwrap_or("https://duckduckgo.com")
+        .to_string()
+}
+
+pub fn resolve_launch_args(valid_urls: &[String], default_startup_url: &str) -> Vec<String> {
+    if valid_urls.is_empty() {
+        vec!["-url".to_string(), default_startup_url.to_string()]
+    } else {
+        let mut args = Vec::with_capacity(valid_urls.len() * 2);
+        for u in valid_urls {
+            args.push("-url".to_string());
+            args.push(u.clone());
+        }
+        args
+    }
+}
+
+/// Prepare or update `<browser_dir>/xulstore.json` so Firefox reads initial window
+/// dimensions and position on startup without unsupported CLI flags (`-width`, `-height`).
+pub fn prepare_xulstore_window(browser_dir: &Path, w: i64, h: i64, x: i64, y: i64) -> Result<()> {
+    if !browser_dir.exists() {
+        fs::create_dir_all(browser_dir)?;
+    }
+    let path = browser_dir.join("xulstore.json");
+    reject_link(&path)?;
+
+    let mut root: Value = if path.exists() {
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
+        serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+
+    if !root.is_object() {
+        root = json!({});
+    }
+
+    let root_obj = root.as_object_mut().expect("root must be object");
+    let chrome_key = "chrome://browser/content/browser.xhtml";
+    let chrome_val = root_obj
+        .entry(chrome_key.to_string())
+        .or_insert_with(|| json!({}));
+
+    if !chrome_val.is_object() {
+        *chrome_val = json!({});
+    }
+
+    let chrome_obj = chrome_val.as_object_mut().expect("chrome must be object");
+    let main_window_val = chrome_obj
+        .entry("main-window".to_string())
+        .or_insert_with(|| json!({}));
+
+    if !main_window_val.is_object() {
+        *main_window_val = json!({});
+    }
+
+    let main_window_obj = main_window_val.as_object_mut().expect("main-window must be object");
+    main_window_obj.insert("width".to_string(), json!(w.to_string()));
+    main_window_obj.insert("height".to_string(), json!(h.to_string()));
+    main_window_obj.insert("screenX".to_string(), json!(x.to_string()));
+    main_window_obj.insert("screenY".to_string(), json!(y.to_string()));
+    main_window_obj.insert("sizemode".to_string(), json!("normal"));
+
+    fs::write(&path, serde_json::to_string_pretty(&root)?)
+        .with_context(|| format!("Failed to write {}", path.display()))?;
+
+    Ok(())
 }
 
 fn prepare_webrtc_pref(browser_dir: &Path, prefs: &Map<String, Value>) -> Result<()> {
@@ -1176,8 +1381,11 @@ impl ProfileSession {
                 let dt_ns = now.duration_since(prev_time).as_nanos() as f64;
                 if dt_ns >= 5_000_000.0 {
                     let d_cpu_ns = ((ticks.saturating_sub(prev_ticks).max(0)) as f64) * 100.0;
-                    let raw = (d_cpu_ns / dt_ns) * 100.0;
-                    let rounded = ((raw.max(0.0)) * 10.0).round() / 10.0;
+                    let cores = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(1) as f64;
+                    let raw = (d_cpu_ns / (dt_ns * cores)) * 100.0;
+                    let rounded = ((raw.clamp(0.0, 100.0)) * 10.0).round() / 10.0;
                     self.last_cpu_sample = Some((now, ticks));
                     self.last_cpu_percent = rounded;
                     rounded
@@ -1407,6 +1615,18 @@ impl Runtime {
                     profile_dirty = true;
                 }
             }
+            if let Some(fp_obj) = profile.get_mut("fingerprint").and_then(Value::as_object_mut) {
+                if !fp_obj.contains_key("window.outerWidth") || !fp_obj.contains_key("window.outerHeight") {
+                    crate::fingerprints::ensure_window_dimensions(fp_obj);
+                    profile_dirty = true;
+                }
+                if !fp_obj.contains_key("headers.User-Agent") {
+                    if let Some(ua) = fp_obj.get("navigator.userAgent").and_then(Value::as_str) {
+                        fp_obj.insert("headers.User-Agent".into(), json!(ua));
+                        profile_dirty = true;
+                    }
+                }
+            }
 
             // 4. Proxy preflight check (fail closed) and proxy bridge acquisition
             let proxy_id = string(&profile, "proxy_id").trim().to_owned();
@@ -1564,11 +1784,19 @@ impl Runtime {
                 .as_object()
                 .cloned()
                 .ok_or_else(|| anyhow!("Profile fingerprint must be a JSON object"))?;
+            crate::fingerprints::ensure_window_dimensions(&mut config_map);
+            if !config_map.contains_key("headers.User-Agent") {
+                if let Some(ua) = config_map.get("navigator.userAgent").and_then(Value::as_str) {
+                    config_map.insert("headers.User-Agent".into(), json!(ua));
+                }
+            }
             if browser_proxy.is_some() {
                 // Camoufox spoofing forces default-route UDP discovery and fabricates unusable ICE.
                 config_map.remove("webrtc:ipv4");
                 config_map.remove("webrtc:ipv6");
             }
+            let (host_w, host_h) = host_work_area();
+            adapt_window_to_host(&mut config_map, host_w, host_h);
 
 
             config_map.remove("webGl2Enabled");
@@ -1580,10 +1808,15 @@ impl Runtime {
                 Value::Array(addon_paths.into_iter().map(Value::String).collect()),
             );
 
+            let search_engine = resolve_search_engine(Some(&profile), Some(&settings));
+            let default_startup_url = resolve_default_startup_url(Some(&profile), Some(&settings));
+
             let user_prefs = build_default_prefs(
                 &config_map,
                 browser_proxy.as_ref().map(|bp| &bp.prefs),
                 !clean_bms.is_empty(),
+                Some(&search_engine),
+                Some(&default_startup_url),
             );
             prepare_webrtc_pref(&browser_dir, &user_prefs)?;
 
@@ -1631,11 +1864,28 @@ impl Runtime {
             cmd.arg("-wait-for-browser");
             if !headless {
                 cmd.arg("-foreground");
+                let launch_w = config_map
+                    .get("window.outerWidth")
+                    .and_then(Value::as_i64)
+                    .filter(|&v| v > 0)
+                    .unwrap_or(1280);
+                let launch_h = config_map
+                    .get("window.outerHeight")
+                    .and_then(Value::as_i64)
+                    .filter(|&v| v > 0)
+                    .unwrap_or(800);
+                let host_x = ((host_w - launch_w) / 2).max(0);
+                let host_y = ((host_h - launch_h) / 2).max(0);
+                if let Err(err) = prepare_xulstore_window(&browser_dir, launch_w, launch_h, host_x, host_y) {
+                    let msg = format!("Failed to prepare xulstore window size/position: {err}");
+                    let _ = self.store.log("WARNING", &msg, id);
+                    warnings.push(msg);
+                }
             }
             cmd.arg("-profile").arg(browser_path_string(&browser_dir));
 
             if valid_urls.is_empty() {
-                cmd.arg("about:blank");
+                cmd.arg("-url").arg(&default_startup_url);
             } else {
                 for u in &valid_urls {
                     cmd.arg("-url").arg(u);
@@ -3048,5 +3298,243 @@ mod tests {
                 assert_ne!(code, 259, "Process must not be STILL_ACTIVE (259)");
             }
         }
+    }
+
+    #[test]
+    fn test_host_work_area_and_window_adaptation() {
+        let (host_w, host_h) = host_work_area();
+        assert!(host_w > 0, "host width must be positive: {host_w}");
+        assert!(host_h > 0, "host height must be positive: {host_h}");
+
+        // When spoofed screen is larger than host, window dimensions fit within host work area
+        let mut config = Map::new();
+        let large_screen_w = host_w + 500;
+        let large_avail_h = host_h + 400;
+        config.insert("screen.width".into(), json!(large_screen_w));
+        config.insert("screen.height".into(), json!(host_h + 450));
+        config.insert("screen.availHeight".into(), json!(large_avail_h));
+        config.insert("window.innerWidth".into(), json!(large_screen_w));
+        config.insert("window.innerHeight".into(), json!(large_avail_h));
+
+        adapt_window_to_host(&mut config, host_w, host_h);
+
+        let launch_w = config["window.outerWidth"].as_i64().expect("outerWidth");
+        let launch_h = config["window.outerHeight"].as_i64().expect("outerHeight");
+
+        // Window fits within host work area
+        assert!(
+            launch_w <= host_w,
+            "launch width must fit within host width: {launch_w} <= {host_w}"
+        );
+        assert!(
+            launch_h <= host_h,
+            "launch height must fit within host height: {launch_h} <= {host_h}"
+        );
+        let expected_w = (host_w - 40).min(large_screen_w).max(800);
+        let expected_h = (host_h - 60).min(large_avail_h).max(600);
+        assert_eq!(launch_w, expected_w);
+        assert_eq!(launch_h, expected_h);
+
+        // Responsive reflow: innerWidth and innerHeight removed
+        assert!(
+            !config.contains_key("window.innerWidth"),
+            "window.innerWidth must be removed from CAMOU_CONFIG"
+        );
+        assert!(
+            !config.contains_key("window.innerHeight"),
+            "window.innerHeight must be removed from CAMOU_CONFIG"
+        );
+
+        // Centered screenX and screenY
+        let sx = config["window.screenX"].as_i64().expect("screenX");
+        let sy = config["window.screenY"].as_i64().expect("screenY");
+        assert_eq!(sx, ((large_screen_w - launch_w) / 2).max(0));
+        assert_eq!(sy, ((large_avail_h - launch_h) / 2).max(0));
+
+        // When spoofed screen is smaller than host, dimensions don't clamp to host,
+        // but innerWidth/innerHeight are still removed
+        let mut small_cfg = Map::new();
+        small_cfg.insert("screen.width".into(), json!(1024));
+        small_cfg.insert("screen.height".into(), json!(768));
+        small_cfg.insert("screen.availHeight".into(), json!(728));
+        small_cfg.insert("window.outerWidth".into(), json!(1000));
+        small_cfg.insert("window.outerHeight".into(), json!(700));
+        small_cfg.insert("window.innerWidth".into(), json!(980));
+        small_cfg.insert("window.innerHeight".into(), json!(650));
+
+        adapt_window_to_host(&mut small_cfg, 1920, 1080);
+        assert_eq!(small_cfg["window.outerWidth"], 1000);
+        assert_eq!(small_cfg["window.outerHeight"], 700);
+        assert!(!small_cfg.contains_key("window.innerWidth"));
+        assert!(!small_cfg.contains_key("window.innerHeight"));
+
+        // Fallback to screen.height when screen.availHeight is missing
+        let mut no_avail = Map::new();
+        no_avail.insert("screen.width".into(), json!(2560));
+        no_avail.insert("screen.height".into(), json!(1440));
+        adapt_window_to_host(&mut no_avail, 1920, 1040);
+        assert_eq!(no_avail["window.outerWidth"], 1880);
+        assert_eq!(no_avail["window.outerHeight"], 980);
+        assert!(!no_avail.contains_key("window.innerWidth"));
+        assert!(!no_avail.contains_key("window.innerHeight"));
+    }
+
+    #[test]
+    fn test_default_search_prefs_and_custom_override() {
+        let mut config = Map::new();
+        config.insert("navigator.oscpu".into(), json!("Windows NT 10.0; Win64; x64"));
+
+        // Defaults to DuckDuckGo and https://duckduckgo.com
+        let default_prefs = build_default_prefs(&config, None, false, None, None);
+        assert_eq!(
+            default_prefs["browser.search.defaultenginename"],
+            "DuckDuckGo"
+        );
+        assert_eq!(default_prefs["browser.search.order.1"], "DuckDuckGo");
+        assert_eq!(default_prefs["browser.search.suggest.enabled"], true);
+        assert_eq!(
+            default_prefs["browser.startup.homepage"],
+            "https://duckduckgo.com"
+        );
+
+        // Custom search engine and homepage override
+        let custom_prefs = build_default_prefs(
+            &config,
+            None,
+            false,
+            Some("Google"),
+            Some("https://google.com"),
+        );
+        assert_eq!(custom_prefs["browser.search.defaultenginename"], "Google");
+        assert_eq!(custom_prefs["browser.search.order.1"], "Google");
+        assert_eq!(custom_prefs["browser.search.suggest.enabled"], true);
+        assert_eq!(custom_prefs["browser.startup.homepage"], "https://google.com");
+    }
+
+    #[test]
+    fn test_search_engine_and_startup_urls_fallback() {
+        // Defaults when profile and settings are None
+        assert_eq!(resolve_search_engine(None, None), "DuckDuckGo");
+        assert_eq!(resolve_default_startup_url(None, None), "https://duckduckgo.com");
+
+        // Profile override takes precedence
+        let profile_custom = json!({
+            "search_engine": "Brave",
+            "default_startup_url": "https://search.brave.com"
+        });
+        let settings = json!({
+            "default_search_engine": "DuckDuckGo",
+            "default_startup_url": "https://duckduckgo.com"
+        });
+        assert_eq!(
+            resolve_search_engine(Some(&profile_custom), Some(&settings)),
+            "Brave"
+        );
+        assert_eq!(
+            resolve_default_startup_url(Some(&profile_custom), Some(&settings)),
+            "https://search.brave.com"
+        );
+
+        // Settings used when profile has no override
+        let profile_empty = json!({});
+        let settings_custom = json!({
+            "default_search_engine": "Ecosia",
+            "default_startup_url": "https://www.ecosia.org"
+        });
+        assert_eq!(
+            resolve_search_engine(Some(&profile_empty), Some(&settings_custom)),
+            "Ecosia"
+        );
+        assert_eq!(
+            resolve_default_startup_url(Some(&profile_empty), Some(&settings_custom)),
+            "https://www.ecosia.org"
+        );
+
+        // Profile startup_url alternate key
+        let profile_alt = json!({
+            "startup_url": "https://lobste.rs"
+        });
+        assert_eq!(
+            resolve_default_startup_url(Some(&profile_alt), Some(&settings)),
+            "https://lobste.rs"
+        );
+
+        // Invalid default startup URLs fall back gracefully
+        let profile_invalid = json!({
+            "default_startup_url": "javascript:alert(1)"
+        });
+        assert_eq!(
+            resolve_default_startup_url(Some(&profile_invalid), None),
+            "https://duckduckgo.com"
+        );
+        let settings_invalid = json!({
+            "default_startup_url": "-headless"
+        });
+        assert_eq!(
+            resolve_default_startup_url(None, Some(&settings_invalid)),
+            "https://duckduckgo.com"
+        );
+        // Profile invalid falls back to valid settings URL
+        assert_eq!(
+            resolve_default_startup_url(Some(&profile_invalid), Some(&settings_custom)),
+            "https://www.ecosia.org"
+        );
+
+        // Empty startup URLs fallback in launch args
+        let empty_urls: Vec<String> = Vec::new();
+        let fallback_args = resolve_launch_args(&empty_urls, "https://duckduckgo.com");
+        assert_eq!(fallback_args, vec!["-url", "https://duckduckgo.com"]);
+        assert!(!fallback_args.contains(&"about:blank".to_string()));
+
+        // Non-empty startup URLs preserve given URLs
+        let specified_urls = vec!["https://example.org".to_string(), "https://rust-lang.org".to_string()];
+        let specified_args = resolve_launch_args(&specified_urls, "https://duckduckgo.com");
+        assert_eq!(
+            specified_args,
+            vec!["-url", "https://example.org", "-url", "https://rust-lang.org"]
+        );
+    }
+
+    #[test]
+    fn test_prepare_xulstore_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xulstore.json");
+
+        // 1. Initial creation when xulstore.json does not exist
+        prepare_xulstore_window(dir.path(), 1280, 800, 100, 50).unwrap();
+        assert!(path.exists());
+
+        let raw: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let main_win = &raw["chrome://browser/content/browser.xhtml"]["main-window"];
+        assert_eq!(main_win["width"], "1280");
+        assert_eq!(main_win["height"], "800");
+        assert_eq!(main_win["screenX"], "100");
+        assert_eq!(main_win["screenY"], "50");
+        assert_eq!(main_win["sizemode"], "normal");
+
+        // 2. Updating existing xulstore.json preserves other elements and overrides main-window geometry
+        let mut existing_root = raw.clone();
+        existing_root["chrome://browser/content/browser.xhtml"]["main-window"]["custom-attr"] = json!("custom-val");
+        existing_root["chrome://browser/content/browser.xhtml"]["other-bar"] = json!({"visible": true});
+        existing_root["other-url"] = json!({"state": 1});
+        fs::write(&path, serde_json::to_string_pretty(&existing_root).unwrap()).unwrap();
+
+        prepare_xulstore_window(dir.path(), 1920, 1080, 200, 150).unwrap();
+
+        let updated: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let updated_win = &updated["chrome://browser/content/browser.xhtml"]["main-window"];
+        assert_eq!(updated_win["width"], "1920");
+        assert_eq!(updated_win["height"], "1080");
+        assert_eq!(updated_win["screenX"], "200");
+        assert_eq!(updated_win["screenY"], "150");
+        assert_eq!(updated_win["sizemode"], "normal");
+        assert_eq!(updated_win["custom-attr"], "custom-val");
+        assert_eq!(updated["chrome://browser/content/browser.xhtml"]["other-bar"]["visible"], true);
+        assert_eq!(updated["other-url"]["state"], 1);
+
+        // 3. Error when browser directory cannot be created or accessed returns Err
+        let file_path = dir.path().join("blocked_dir");
+        fs::write(&file_path, "not a directory").unwrap();
+        assert!(prepare_xulstore_window(&file_path.join("child"), 1280, 800, 0, 0).is_err());
     }
 }

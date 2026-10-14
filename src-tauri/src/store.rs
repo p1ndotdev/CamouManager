@@ -121,7 +121,7 @@ impl Store {
     }
     pub fn settings(&self) -> Result<Value> {
         let raw: Option<String> = self.db.lock().query_row("SELECT payload FROM settings WHERE id=1", [], |row| row.get(0)).optional()?;
-        let mut defaults = json!({"max_running":4,"default_proxy_id":"","auto_assign_proxy":false,"backup_interval_hours":0,"backup_retention":10,"auto_check_updates":true,"update_check_hours":24,"auto_download_updates":false,"last_scheduled_backup_at":"","last_update_check_at":""});
+        let mut defaults = json!({"max_running":4,"default_proxy_id":"","auto_assign_proxy":false,"backup_interval_hours":0,"backup_retention":10,"auto_check_updates":true,"update_check_hours":24,"auto_download_updates":false,"last_scheduled_backup_at":"","last_update_check_at":"","default_startup_url":"https://duckduckgo.com","default_search_engine":"DuckDuckGo"});
         if let Some(raw) = raw {
             let saved: Map<String, Value> = serde_json::from_str(&raw)?;
             defaults.as_object_mut().expect("object defaults").extend(saved);
@@ -145,7 +145,7 @@ impl Store {
         for key in ["auto_assign_proxy", "auto_check_updates", "auto_download_updates"] {
             if !target[key].is_boolean() { bail!("{key} phải là boolean"); }
         }
-        for key in ["default_proxy_id", "last_scheduled_backup_at", "last_update_check_at"] {
+        for key in ["default_proxy_id", "last_scheduled_backup_at", "last_update_check_at", "default_startup_url", "default_search_engine"] {
             if !target[key].is_string() { bail!("{key} phải là chuỗi"); }
         }
         let proxy_id = string(&settings, "default_proxy_id");
@@ -209,10 +209,14 @@ mod tests {
     #[test]
     fn settings_validation_preserves_saved_values_and_never_saves_password() {
         let root = tempfile::tempdir().unwrap(); let store = Store::open(root.path()).unwrap();
-        store.save_settings(json!({"max_running":7})).unwrap();
+        assert_eq!(store.settings().unwrap()["default_startup_url"], "https://duckduckgo.com");
+        assert_eq!(store.settings().unwrap()["default_search_engine"], "DuckDuckGo");
+        store.save_settings(json!({"max_running":7, "default_startup_url": "https://example.com", "default_search_engine": "Google"})).unwrap();
         assert!(store.save_settings(json!({"max_running":0})).is_err());
         assert!(store.save_settings(json!({"backup_password":"secret"})).is_err());
         assert_eq!(store.settings().unwrap()["max_running"],7);
+        assert_eq!(store.settings().unwrap()["default_startup_url"], "https://example.com");
+        assert_eq!(store.settings().unwrap()["default_search_engine"], "Google");
         assert!(store.settings().unwrap().get("backup_password").is_none());
     }
     #[test]

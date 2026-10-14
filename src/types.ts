@@ -27,6 +27,7 @@ export interface Profile {
   note: string;
   os: string;
   browser_version: string;
+  search_engine?: string;
   proxy_id: string;
   proxy_name?: string;
   location: Location;
@@ -34,7 +35,7 @@ export interface Profile {
   bookmarks: {title: string; url: string}[];
   extensions: string[];
   fingerprint?: Record<string, unknown>;
-  fingerprint_meta?: {use_preset?: boolean; generated_at?: string};
+  fingerprint_meta?: {use_preset?: boolean; generated_at?: string; screen?: string};
   created_at: string;
   updated_at: string;
   state?: Status['state'];
@@ -89,6 +90,8 @@ export interface Settings {
   auto_assign_proxy: boolean;
   backup_interval_hours: number;
   backup_retention: number;
+  default_startup_url?: string;
+  default_search_engine?: string;
   auto_check_updates?: boolean;
   update_check_hours: number;
   auto_download_updates: boolean;

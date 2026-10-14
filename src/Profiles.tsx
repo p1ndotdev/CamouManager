@@ -49,7 +49,6 @@ export default function Profiles({
 
   // Row / View menus
   const [rowMenu, setRowMenu] = useState<{ profileId: string; x: number; y: number } | null>(null);
-  const [viewMenuPos, setViewMenuPos] = useState<{ x: number; y: number } | null>(null);
 
   // Dialog states
   const [editorState, setEditorState] = useState<{ open: boolean; profile: Profile | null }>({
@@ -360,6 +359,14 @@ export default function Profiles({
       return next;
     });
   }, []);
+  const isAllSelected = filteredProfiles.length > 0 && filteredProfiles.every((p) => selectedIds.has(p.id));
+  const handleToggleSelectAll = useCallback(() => {
+    if (isAllSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filteredProfiles.map((p) => p.id)));
+    }
+  }, [isAllSelected, filteredProfiles]);
 
   const openEditModal = useCallback((p: Profile) => {
     setEditorState({ open: true, profile: p });
@@ -895,6 +902,16 @@ export default function Profiles({
           >
             {t('Bộ lọc', 'Filters')}
           </Button>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={filteredProfiles.length === 0}
+            onClick={handleToggleSelectAll}
+          >
+            {isAllSelected
+              ? t('Bỏ chọn tất cả', 'Deselect all')
+              : t('Chọn tất cả', 'Select all')}
+          </Button>
           <span className="cm-muted-text">
             {t(`${filteredProfiles.length} trên ${totalCount} dòng`, `${filteredProfiles.length} of ${totalCount} rows`)}
           </span>
@@ -994,15 +1011,10 @@ export default function Profiles({
           <Button
             variant="secondary"
             size="sm"
-            onClick={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              setViewMenuPos({
-                x: Math.min(rect.left, window.innerWidth - 200),
-                y: rect.bottom + 4,
-              });
-            }}
+            onClick={() => onRefresh()}
+            title={t('Làm mới dữ liệu', 'Refresh data')}
           >
-            {t('Chế độ xem', 'View options')}
+            {t('Làm mới', 'Refresh')}
           </Button>
         </div>
       </div>
@@ -1124,44 +1136,6 @@ export default function Profiles({
         )}
       </div>
 
-      {/* View Options Menu */}
-      {viewMenuPos ? (
-        <>
-          <div className="cm-menu-backdrop" onClick={() => setViewMenuPos(null)} />
-          <div className="cm-menu" style={{ left: viewMenuPos.x, top: viewMenuPos.y }} role="menu">
-            <button
-              type="button"
-              className="cm-menu-item"
-              onClick={() => {
-                setViewMenuPos(null);
-                onRefresh();
-              }}
-            >
-              {t('Làm mới dữ liệu', 'Refresh data')}
-            </button>
-            <button
-              type="button"
-              className="cm-menu-item"
-              onClick={() => {
-                setSelectedIds(new Set(filteredProfiles.map((p) => p.id)));
-                setViewMenuPos(null);
-              }}
-            >
-              {t(`Chọn tất cả (${filteredProfiles.length})`, `Select all (${filteredProfiles.length})`)}
-            </button>
-            <button
-              type="button"
-              className="cm-menu-item"
-              onClick={() => {
-                setSelectedIds(new Set());
-                setViewMenuPos(null);
-              }}
-            >
-              {t('Bỏ chọn tất cả', 'Deselect all')}
-            </button>
-          </div>
-        </>
-      ) : null}
 
       {/* Row Context / Action Menu */}
       {rowMenu && activeMenuProfile ? (

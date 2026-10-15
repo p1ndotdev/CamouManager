@@ -1202,6 +1202,7 @@ impl Versions {
             cleanup_staging.lock().take();
 
             let final_exe = final_target.join("camoufox.exe");
+            let _ = crate::runtime::ensure_distribution_policies(&final_exe, "DuckDuckGo");
             let record = json!({
                 "id": id,
                 "name": release_name,

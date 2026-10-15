@@ -484,19 +484,18 @@ pub fn build_default_prefs(
         prefs.insert("network.proxy.socks_port".into(), json!(0));
     }
 
-    let search_engine = search_engine
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("DuckDuckGo");
+    let _ = search_engine;
     let startup_homepage = startup_homepage
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("https://duckduckgo.com");
 
-    prefs.insert("browser.search.defaultenginename".into(), json!(search_engine));
-    prefs.insert("browser.search.order.1".into(), json!(search_engine));
     prefs.insert("browser.search.suggest.enabled".into(), json!(true));
     prefs.insert("browser.startup.homepage".into(), json!(startup_homepage));
+    prefs.insert(
+        "toolkit.legacyUserProfileCustomizations.stylesheets".into(),
+        json!(true),
+    );
 
     prefs
 }
@@ -610,6 +609,97 @@ pub fn prepare_xulstore_window(browser_dir: &Path, w: i64, h: i64, x: i64, y: i6
     fs::write(&path, serde_json::to_string_pretty(&root)?)
         .with_context(|| format!("Failed to write {}", path.display()))?;
 
+    Ok(())
+}
+
+pub fn prepare_user_chrome_css(browser_dir: &Path) -> Result<()> {
+    let chrome_dir = browser_dir.join("chrome");
+    if !chrome_dir.exists() {
+        fs::create_dir_all(&chrome_dir)?;
+    }
+    let css_path = chrome_dir.join("userChrome.css");
+    let css_content = r#":root[remotecontrol] #remote-control-box {
+  display: none !important;
+}
+:root[remotecontrol] .urlbar-background {
+  background-image: none !important;
+}
+#remote-control-panel, #remote-control-toolbar-button {
+  display: none !important;
+}
+"#;
+    fs::write(&css_path, css_content)?;
+    Ok(())
+}
+
+pub fn ensure_distribution_policies(exe_path: &Path, search_engine: &str) -> Result<()> {
+    let Some(exe_dir) = exe_path.parent() else {
+        return Ok(());
+    };
+    let dist_dir = exe_dir.join("distribution");
+    let policy_path = dist_dir.join("policies.json");
+    if !dist_dir.exists() {
+        fs::create_dir_all(&dist_dir)?;
+    }
+    let mut root: Value = if policy_path.exists() {
+        let content = fs::read_to_string(&policy_path).unwrap_or_else(|_| "{}".to_string());
+        serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+    } else {
+        json!({})
+    };
+    if !root.is_object() {
+        root = json!({});
+    }
+    let root_map = root.as_object_mut().unwrap();
+    let policies = root_map.entry("policies".to_string()).or_insert_with(|| json!({}));
+    if !policies.is_object() {
+        *policies = json!({});
+    }
+    let p_obj = policies.as_object_mut().unwrap();
+
+    let default_engine = if search_engine.trim().is_empty() {
+        "DuckDuckGo"
+    } else {
+        search_engine.trim()
+    };
+
+    let search_engines = json!({
+        "PreventInstalls": false,
+        "Default": default_engine,
+        "Add": [
+            {
+                "Name": "DuckDuckGo",
+                "URLTemplate": "https://duckduckgo.com/?q={searchTerms}",
+                "Method": "GET",
+                "Alias": "@ddg",
+                "Description": "DuckDuckGo Search"
+            },
+            {
+                "Name": "Google",
+                "URLTemplate": "https://www.google.com/search?q={searchTerms}",
+                "Method": "GET",
+                "Alias": "@google",
+                "Description": "Google Search"
+            },
+            {
+                "Name": "Bing",
+                "URLTemplate": "https://www.bing.com/search?q={searchTerms}",
+                "Method": "GET",
+                "Alias": "@bing",
+                "Description": "Bing Search"
+            }
+        ]
+    });
+
+    p_obj.insert("SearchEngines".into(), search_engines);
+
+    if let Some(exts) = p_obj.get_mut("Extensions").and_then(Value::as_object_mut) {
+        if let Some(un) = exts.get_mut("Uninstall").and_then(Value::as_array_mut) {
+            un.retain(|v| !v.as_str().is_some_and(|s| s.ends_with("@search.mozilla.org")));
+        }
+    }
+
+    let _ = fs::write(&policy_path, serde_json::to_string_pretty(&root)?);
     Ok(())
 }
 
@@ -1862,8 +1952,10 @@ impl Runtime {
                 cmd.arg("-headless");
             }
             cmd.arg("-wait-for-browser");
+            let _ = ensure_distribution_policies(&exe_path, &search_engine);
             if !headless {
                 cmd.arg("-foreground");
+                let _ = prepare_user_chrome_css(&browser_dir);
                 let launch_w = config_map
                     .get("window.outerWidth")
                     .and_then(Value::as_i64)
@@ -3386,11 +3478,11 @@ mod tests {
 
         // Defaults to DuckDuckGo and https://duckduckgo.com
         let default_prefs = build_default_prefs(&config, None, false, None, None);
+        assert_eq!(default_prefs["browser.search.suggest.enabled"], true);
         assert_eq!(
-            default_prefs["browser.search.defaultenginename"],
-            "DuckDuckGo"
+            default_prefs["toolkit.legacyUserProfileCustomizations.stylesheets"],
+            true
         );
-        assert_eq!(default_prefs["browser.search.order.1"], "DuckDuckGo");
         assert_eq!(default_prefs["browser.search.suggest.enabled"], true);
         assert_eq!(
             default_prefs["browser.startup.homepage"],
@@ -3405,9 +3497,11 @@ mod tests {
             Some("Google"),
             Some("https://google.com"),
         );
-        assert_eq!(custom_prefs["browser.search.defaultenginename"], "Google");
-        assert_eq!(custom_prefs["browser.search.order.1"], "Google");
         assert_eq!(custom_prefs["browser.search.suggest.enabled"], true);
+        assert_eq!(
+            custom_prefs["toolkit.legacyUserProfileCustomizations.stylesheets"],
+            true
+        );
         assert_eq!(custom_prefs["browser.startup.homepage"], "https://google.com");
     }
 
@@ -3536,5 +3630,32 @@ mod tests {
         let file_path = dir.path().join("blocked_dir");
         fs::write(&file_path, "not a directory").unwrap();
         assert!(prepare_xulstore_window(&file_path.join("child"), 1280, 800, 0, 0).is_err());
+    }
+
+    #[test]
+    fn test_prepare_user_chrome_css() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare_user_chrome_css(dir.path()).unwrap();
+        let css_file = dir.path().join("chrome/userChrome.css");
+        assert!(css_file.is_file());
+        let content = fs::read_to_string(&css_file).unwrap();
+        assert!(content.contains(":root[remotecontrol] #remote-control-box"));
+        assert!(content.contains(":root[remotecontrol] .urlbar-background"));
+        assert!(content.contains("background-image: none !important"));
+    }
+
+    #[test]
+    fn test_ensure_distribution_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("camoufox.exe");
+        fs::write(&exe, b"").unwrap();
+        ensure_distribution_policies(&exe, "DuckDuckGo").unwrap();
+        let policy_file = dir.path().join("distribution/policies.json");
+        assert!(policy_file.is_file());
+        let val: Value = serde_json::from_str(&fs::read_to_string(&policy_file).unwrap()).unwrap();
+        assert_eq!(val["policies"]["SearchEngines"]["Default"], "DuckDuckGo");
+        assert_eq!(val["policies"]["SearchEngines"]["PreventInstalls"], false);
+        let adds = val["policies"]["SearchEngines"]["Add"].as_array().unwrap();
+        assert!(adds.iter().any(|e| e["Name"] == "DuckDuckGo" && e["URLTemplate"].as_str().unwrap().contains("{searchTerms}")));
     }
 }

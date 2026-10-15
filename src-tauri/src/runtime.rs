@@ -618,13 +618,25 @@ pub fn prepare_user_chrome_css(browser_dir: &Path) -> Result<()> {
         fs::create_dir_all(&chrome_dir)?;
     }
     let css_path = chrome_dir.join("userChrome.css");
-    let css_content = r#":root[remotecontrol] #remote-control-box {
+    let css_content = r#":root[remotecontrol] #remote-control-box,
+#remote-control-box,
+#remote-control-icon {
   display: none !important;
+  visibility: collapse !important;
+  width: 0 !important;
+  height: 0 !important;
+  padding: 0 !important;
+  margin: 0 !important;
 }
-:root[remotecontrol] .urlbar-background {
+
+:root[remotecontrol] .urlbar-background,
+:root[remotecontrol] #urlbar-background,
+.urlbar-background {
   background-image: none !important;
 }
-#remote-control-panel, #remote-control-toolbar-button {
+
+#remote-control-panel,
+#remote-control-toolbar-button {
   display: none !important;
 }
 "#;
@@ -728,7 +740,11 @@ fn prepare_webrtc_pref(browser_dir: &Path, prefs: &Map<String, Value>) -> Result
     // User-branch prefs override CAMOU_PREFS; enforce this before any startup URL can run.
     if !ends_with_newline { writeln!(file)?; }
     for (key, value) in prefs {
-        if key.starts_with("media.peerconnection.") || key.starts_with("network.proxy.") || key.starts_with("media.webrtc.") {
+        if key.starts_with("media.peerconnection.")
+            || key.starts_with("network.proxy.")
+            || key.starts_with("media.webrtc.")
+            || key == "toolkit.legacyUserProfileCustomizations.stylesheets"
+        {
             writeln!(file, "user_pref({}, {}); // CamouManager WebRTC", serde_json::to_string(key)?, value)?;
         }
     }

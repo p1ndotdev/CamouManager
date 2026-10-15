@@ -20,9 +20,9 @@ Yêu cầu **Windows 10/11 x64** và **Microsoft Edge WebView2 Runtime**.
 
 Đổi Tiếng Việt / English tại **Cài đặt → Ngôn ngữ giao diện**. Lựa chọn được ghi nhớ, không thay đổi locale của fingerprint. Log và chi tiết lỗi kỹ thuật giữ nguyên ngôn ngữ gốc.
 
-### Cập nhật lên v1.0.4
+### Cập nhật lên v1.0.5
 
-Bản v1.0.4 đồng bộ kích thước cửa sổ và màn hình ảo (`screen.width/height`), tự động nhận diện màn hình máy thật (`host_work_area`) để mở cửa sổ vừa vặn và căn giữa; mở khóa co giãn giao diện web responsive khi kéo thả viền cửa sổ. Bổ sung tùy chọn độ phân giải màn hình tùy chỉnh hoặc ngẫu nhiên, cảnh báo lệch vị trí Proxy kèm nút đồng bộ 1 chạm, mặc định mở và tìm kiếm bằng DuckDuckGo (có thể cấu hình trong Cài đặt và từng hồ sơ), tối ưu chuẩn hóa CPU theo số luồng máy thật (chuẩn Windows Task Manager), cải tiến giao diện chọn phiên bản và nút thao tác danh sách hồ sơ.
+Bản v1.0.5 đồng bộ kích thước cửa sổ và màn hình ảo (`screen.width/height`), tự động nhận diện màn hình máy thật (`host_work_area`) để mở cửa sổ vừa vặn và căn giữa; mở khóa co giãn giao diện web responsive khi kéo thả viền cửa sổ. Bổ sung tùy chọn độ phân giải màn hình tùy chỉnh hoặc ngẫu nhiên, cảnh báo lệch vị trí Proxy kèm nút đồng bộ 1 chạm, mặc định mở và tìm kiếm bằng DuckDuckGo (có thể cấu hình trong Cài đặt và từng hồ sơ), tối ưu chuẩn hóa CPU theo số luồng máy thật (chuẩn Windows Task Manager), cải tiến giao diện chọn phiên bản và nút thao tác danh sách hồ sơ. Bổ sung cơ chế ẩn dải đỏ và biểu tượng robot điều khiển từ xa (RemoteAgent/BiDi) trực tiếp tại tệp `chrome.css` ở thư mục gốc cài đặt trình duyệt (bảo lưu CSS sẵn có và idempotent, thay thế việc ghi profile `userChrome.css` không hiệu lực).
 
 ### Cập nhật lên v1.0.3
 
@@ -75,8 +75,8 @@ Trước mỗi release, cập nhật cùng version trong `package.json`, `packag
 Ví dụ phát hành version hiện tại, sau khi commit và push mã nguồn cùng workflow:
 
 ```powershell
-git tag v1.0.3
-git push origin v1.0.3
+git tag v1.0.5
+git push origin v1.0.5
 ```
 
 Để chỉ build thử, vào **Actions → Windows release → Run workflow** trên branch cần build. Tải kết quả ở **Artifacts** của lần chạy; artifact được giữ 7 ngày, không tạo Release khi chạy thủ công. Workflow phải có trên default branch để nút chạy thủ công xuất hiện. Mỗi bản phát hành dùng một tag mới; bước tạo Release sẽ báo lỗi nếu Release cho tag đó đã tồn tại.

@@ -492,10 +492,6 @@ pub fn build_default_prefs(
 
     prefs.insert("browser.search.suggest.enabled".into(), json!(true));
     prefs.insert("browser.startup.homepage".into(), json!(startup_homepage));
-    prefs.insert(
-        "toolkit.legacyUserProfileCustomizations.stylesheets".into(),
-        json!(true),
-    );
 
     prefs
 }
@@ -612,35 +608,48 @@ pub fn prepare_xulstore_window(browser_dir: &Path, w: i64, h: i64, x: i64, y: i6
     Ok(())
 }
 
-pub fn prepare_user_chrome_css(browser_dir: &Path) -> Result<()> {
-    let chrome_dir = browser_dir.join("chrome");
-    if !chrome_dir.exists() {
-        fs::create_dir_all(&chrome_dir)?;
+const MANAGED_CHROME_CSS: &str = ":root[remotecontrol] #remote-control-box { display: none !important; }\n:root[remotecontrol] .urlbar-background { background-image: none !important; }\n";
+
+pub fn prepare_browser_chrome_css(executable_path: &Path) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let parent = executable_path
+        .parent()
+        .ok_or_else(|| anyhow!("Browser executable has no parent directory"))?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    reject_link(parent)?;
+    let path = parent.join("chrome.css");
+    reject_link(&path)?;
+
+    let old = match fs::File::open(&path) {
+        Ok(file) => {
+            let mut text = String::new();
+            file.take(4 * 1024 * 1024 + 1).read_to_string(&mut text)?;
+            if text.len() > 4 * 1024 * 1024 {
+                bail!("chrome.css exceeds 4 MiB");
+            }
+            text
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    if old.contains(MANAGED_CHROME_CSS) {
+        return Ok(());
     }
-    let css_path = chrome_dir.join("userChrome.css");
-    let css_content = r#":root[remotecontrol] #remote-control-box,
-#remote-control-box,
-#remote-control-icon {
-  display: none !important;
-  visibility: collapse !important;
-  width: 0 !important;
-  height: 0 !important;
-  padding: 0 !important;
-  margin: 0 !important;
-}
 
-:root[remotecontrol] .urlbar-background,
-:root[remotecontrol] #urlbar-background,
-.urlbar-background {
-  background-image: none !important;
-}
-
-#remote-control-panel,
-#remote-control-toolbar-button {
-  display: none !important;
-}
-"#;
-    fs::write(&css_path, css_content)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    file.write_all(old.as_bytes())?;
+    if !old.is_empty() && !old.ends_with('\n') {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(MANAGED_CHROME_CSS.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(&path)?;
     Ok(())
 }
 
@@ -743,7 +752,6 @@ fn prepare_webrtc_pref(browser_dir: &Path, prefs: &Map<String, Value>) -> Result
         if key.starts_with("media.peerconnection.")
             || key.starts_with("network.proxy.")
             || key.starts_with("media.webrtc.")
-            || key == "toolkit.legacyUserProfileCustomizations.stylesheets"
         {
             writeln!(file, "user_pref({}, {}); // CamouManager WebRTC", serde_json::to_string(key)?, value)?;
         }
@@ -1971,7 +1979,7 @@ impl Runtime {
             let _ = ensure_distribution_policies(&exe_path, &search_engine);
             if !headless {
                 cmd.arg("-foreground");
-                let _ = prepare_user_chrome_css(&browser_dir);
+                prepare_browser_chrome_css(&exe_path)?;
                 let launch_w = config_map
                     .get("window.outerWidth")
                     .and_then(Value::as_i64)
@@ -3496,11 +3504,6 @@ mod tests {
         let default_prefs = build_default_prefs(&config, None, false, None, None);
         assert_eq!(default_prefs["browser.search.suggest.enabled"], true);
         assert_eq!(
-            default_prefs["toolkit.legacyUserProfileCustomizations.stylesheets"],
-            true
-        );
-        assert_eq!(default_prefs["browser.search.suggest.enabled"], true);
-        assert_eq!(
             default_prefs["browser.startup.homepage"],
             "https://duckduckgo.com"
         );
@@ -3514,10 +3517,6 @@ mod tests {
             Some("https://google.com"),
         );
         assert_eq!(custom_prefs["browser.search.suggest.enabled"], true);
-        assert_eq!(
-            custom_prefs["toolkit.legacyUserProfileCustomizations.stylesheets"],
-            true
-        );
         assert_eq!(custom_prefs["browser.startup.homepage"], "https://google.com");
     }
 
@@ -3649,15 +3648,25 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_user_chrome_css() {
+    fn test_prepare_browser_chrome_css() {
         let dir = tempfile::tempdir().unwrap();
-        prepare_user_chrome_css(dir.path()).unwrap();
-        let css_file = dir.path().join("chrome/userChrome.css");
-        assert!(css_file.is_file());
-        let content = fs::read_to_string(&css_file).unwrap();
-        assert!(content.contains(":root[remotecontrol] #remote-control-box"));
-        assert!(content.contains(":root[remotecontrol] .urlbar-background"));
-        assert!(content.contains("background-image: none !important"));
+        let exe = dir.path().join("camoufox.exe");
+        let css_path = dir.path().join("chrome.css");
+
+        let initial_css = ":root[remotecontrol] #remote-control-box { display: inline-block; }\n:root[remotecontrol] .urlbar-background { background-image: linear-gradient(blue, green); }\n";
+        fs::write(&css_path, initial_css).unwrap();
+        prepare_browser_chrome_css(&exe).unwrap();
+        let content_after_first = fs::read_to_string(&css_path).unwrap();
+        assert_ne!(content_after_first, initial_css);
+        assert!(content_after_first.starts_with(initial_css));
+
+        prepare_browser_chrome_css(&exe).unwrap();
+        let content_after_second = fs::read_to_string(&css_path).unwrap();
+        assert_eq!(content_after_first, content_after_second);
+
+        let blocked = dir.path().join("not_a_dir");
+        fs::write(&blocked, "file").unwrap();
+        assert!(prepare_browser_chrome_css(&blocked.join("camoufox.exe")).is_err());
     }
 
     #[test]

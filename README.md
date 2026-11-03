@@ -1,24 +1,24 @@
 # CamouManager
 
-Ứng dụng quản lý hồ sơ trình duyệt [Camoufox](https://github.com/daijro/camoufox) trên Windows (x64), viết bằng Rust, Tauri 2 và React/TypeScript.
+Desktop profile manager for [Camoufox](https://github.com/daijro/camoufox) on Windows (x64), built with Rust, Tauri 2, and React/TypeScript.
 
-## Tính năng chính
+## Features
 
-- Tạo, nhân bản và chạy nhiều hồ sơ độc lập (fingerprint, cookie, tiện ích mở rộng, dấu trang).
-- Quản lý proxy HTTP/HTTPS/SOCKS5, kiểm tra kết nối và tự động đồng bộ vị trí/múi giờ theo IP.
-- Tải, cập nhật và đổi phiên bản Camoufox cho từng hồ sơ hoặc hàng loạt.
-- Sao lưu và khôi phục dữ liệu hồ sơ có mã hóa mật khẩu (AES-GCM).
-- Tự động kiểm tra và cập nhật ứng dụng từ GitHub.
-- Hỗ trợ giao diện Tiếng Việt và Tiếng Anh.
+- Create, clone, and run isolated browser profiles (fingerprints, cookies, extensions, bookmarks).
+- Manage HTTP/HTTPS/SOCKS5 proxies with health checks and automatic IP/GeoIP location sync.
+- Download, pin, and batch-switch Camoufox versions across profiles.
+- Password-encrypted profile backups and restores (AES-GCM).
+- Built-in GitHub self-updater with optional auto-update.
+- English and Vietnamese interface.
 
-## Cài đặt & Sử dụng
+## Getting Started
 
-1. Tải bản cài đặt `CamouManager-Setup.exe` hoặc bản giải nén `CamouManager-Portable.zip` tại mục [Releases](https://github.com/p1ndotdev/CamouManager/releases).
-2. Vào **Cài đặt → Phiên bản & Dữ liệu Fingerprint** để tải phiên bản trình duyệt Camoufox.
-3. Vào **Hồ sơ → Tạo mới**, cấu hình hồ sơ và nhấn **Khởi chạy**.
+1. Download `CamouManager-Setup.exe` or `CamouManager-Portable.zip` from [Releases](https://github.com/p1ndotdev/CamouManager/releases).
+2. Open **Settings → Versions & Fingerprint Data** to install a Camoufox release.
+3. Open **Profiles → Create**, configure your profile, and click **Launch**.
 
-Dữ liệu hồ sơ mặc định lưu tại `%LOCALAPPDATA%\CamouManagerRust` (có thể đổi bằng biến môi trường `CAMOUMANAGER_HOME`).
+Profile data is stored in `%LOCALAPPDATA%\CamouManagerRust` by default (customizable via `CAMOUMANAGER_HOME`).
 
-## Giấy phép
+## License
 
-Phát hành theo giấy phép [GPL-3.0-only](LICENSE). Mã nguồn: https://github.com/p1ndotdev/CamouManager.
+Licensed under [GPL-3.0-only](LICENSE). Source code: https://github.com/p1ndotdev/CamouManager.

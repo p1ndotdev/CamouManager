@@ -80,6 +80,10 @@ export default function Profiles({
   const [batchGroupText, setBatchGroupText] = useState('');
   const [batchGroupSaving, setBatchGroupSaving] = useState(false);
 
+  const [batchVersionOpen, setBatchVersionOpen] = useState(false);
+  const [batchVersionId, setBatchVersionId] = useState('');
+  const [batchVersionSaving, setBatchVersionSaving] = useState(false);
+
   const [backupModalIds, setBackupModalIds] = useState<string[] | null>(null);
   const [backupSelectedSet, setBackupSelectedSet] = useState<Set<string>>(() => new Set());
   const [backupDest, setBackupDest] = useState('');
@@ -741,6 +745,34 @@ export default function Profiles({
     }
   };
 
+  const handleBatchSetVersion = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    setBatchVersionSaving(true);
+    try {
+      await request<null>('profile.set_version', { ids, browser_version: batchVersionId });
+      setBatchVersionOpen(false);
+      await onRefresh();
+      onMessage(
+        t(
+          `Đã cập nhật phiên bản Camoufox cho ${ids.length} profile.`,
+          `Updated Camoufox version for ${ids.length} profile${ids.length > 1 ? 's' : ''}.`
+        ),
+        'info'
+      );
+    } catch (err) {
+      onMessage(
+        t(
+          `Lỗi đổi phiên bản: ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to change version: ${err instanceof Error ? err.message : String(err)}`
+        ),
+        'error'
+      );
+    } finally {
+      setBatchVersionSaving(false);
+    }
+  };
+
   const executeCreateBackup = async () => {
     const ids = Array.from(backupSelectedSet);
     if (ids.length === 0) {
@@ -953,6 +985,17 @@ export default function Profiles({
                 }}
               >
                 {t('Gán proxy', 'Assign proxy')}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                disabled={busyAction}
+                onClick={() => {
+                  setBatchVersionId(snapshot.versions[0]?.id || '');
+                  setBatchVersionOpen(true);
+                }}
+              >
+                {t('Đổi phiên bản', 'Change version')}
               </Button>
               <Button
                 variant="secondary"
@@ -1472,6 +1515,54 @@ export default function Profiles({
               ))}
             </select>
           </Field>
+        </Modal>
+      ) : null}
+
+      {/* Batch Change Camoufox Version Dialog */}
+      {batchVersionOpen ? (
+        <Modal
+          open={true}
+          busy={batchVersionSaving}
+          title={t('Đổi phiên bản Camoufox hàng loạt', 'Batch Change Camoufox Version')}
+          onClose={() => setBatchVersionOpen(false)}
+          width={440}
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setBatchVersionOpen(false)} disabled={batchVersionSaving}>
+                {t('Hủy bỏ', 'Cancel')}
+              </Button>
+              <Button variant="primary" onClick={handleBatchSetVersion} loading={batchVersionSaving}>
+                {t('Lưu phiên bản', 'Save version')}
+              </Button>
+            </>
+          }
+        >
+          <Field
+            label={t(
+              `Chọn phiên bản Camoufox cho ${selectedIds.size} profile đã chọn:`,
+              `Select Camoufox version for ${selectedIds.size} selected profile${selectedIds.size > 1 ? 's' : ''}:`
+            )}
+            htmlFor="batch-version-select"
+          >
+            <select
+              id="batch-version-select"
+              value={batchVersionId}
+              onChange={(e) => setBatchVersionId(e.target.value)}
+            >
+              <option value="">{t('Mặc định hệ thống', 'System default')}</option>
+              {snapshot.versions.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.id} {v.name ? `(${v.name})` : ''}
+                </option>
+              ))}
+            </select>
+          </Field>
+          <div className="cm-banner cm-banner-warning" style={{ marginTop: 12 }}>
+            {t(
+              'Lưu ý: Thay đổi phiên bản trình duyệt Camoufox có thể cập nhật User-Agent đối với các website đã truy cập.',
+              'Note: Changing the Camoufox browser version may update User-Agent for previously visited websites.'
+            )}
+          </div>
         </Modal>
       ) : null}
 

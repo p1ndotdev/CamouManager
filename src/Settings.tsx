@@ -40,6 +40,10 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
   const [autoDownloadUpdates, setAutoDownloadUpdates] = useState<boolean>(
     snapshot.settings?.auto_download_updates ?? false
   );
+  const [autoUpdateApp, setAutoUpdateApp] = useState<boolean>(
+    snapshot.settings?.auto_update_app ?? false
+  );
+  const [updatingApp, setUpdatingApp] = useState(false);
   const [defaultProxyId, setDefaultProxyId] = useState<string>(
     snapshot.settings?.default_proxy_id ?? ''
   );
@@ -64,6 +68,8 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
         setUpdateCheckHours(snapshot.settings.update_check_hours);
       if (snapshot.settings.auto_download_updates !== undefined)
         setAutoDownloadUpdates(snapshot.settings.auto_download_updates);
+      if (snapshot.settings.auto_update_app !== undefined)
+        setAutoUpdateApp(snapshot.settings.auto_update_app);
       if (snapshot.settings.default_proxy_id !== undefined)
         setDefaultProxyId(snapshot.settings.default_proxy_id);
       if (snapshot.settings.auto_assign_proxy !== undefined)
@@ -303,6 +309,7 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
           auto_check_updates: autoCheckUpdates,
           update_check_hours: updateCheckHours,
           auto_download_updates: autoDownloadUpdates,
+          auto_update_app: autoUpdateApp,
           default_proxy_id: defaultProxyId,
           auto_assign_proxy: autoAssignProxy,
           default_startup_url: defaultStartupUrl.trim(),
@@ -553,8 +560,20 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
       </div>
 
       {/* Language Preference Card */}
+      {/* Language & App Update Card */}
       <div style={{ padding: '16px 20px 0 20px', backgroundColor: 'var(--bg-main)' }}>
-        <div className="cm-card" style={{ marginBottom: 0, padding: '12px 16px' }}>
+        <div
+          className="cm-card"
+          style={{
+            marginBottom: 0,
+            padding: '12px 16px',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: 16,
+          }}
+        >
           <Field
             label={t('Ngôn ngữ giao diện', 'Interface language')}
             hint={t('Lựa chọn ngôn ngữ được ghi nhớ trên thiết bị này.', 'Language preference is remembered on this device.')}
@@ -575,6 +594,75 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
               <option value="en">English</option>
             </select>
           </Field>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+            <div style={{ fontSize: 12 }}>
+              <strong>CamouManager v{snapshot.app_update?.current_version || '1.0.6'}</strong>
+              {snapshot.app_update?.state === 'ready' ? (
+                <div style={{ color: 'var(--success)', marginTop: 2 }}>
+                  {t(
+                    `Đã cài đặt ${snapshot.app_update.latest_version} — tắt và mở lại ứng dụng để cập nhật.`,
+                    `Staged ${snapshot.app_update.latest_version} — close and reopen app to apply.`
+                  )}
+                </div>
+              ) : null}
+            </div>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                className="cm-checkbox"
+                checked={autoUpdateApp}
+                onChange={async (e) => {
+                  const nextVal = e.target.checked;
+                  setAutoUpdateApp(nextVal);
+                  try {
+                    await request('settings.save', { data: { auto_update_app: nextVal } });
+                    await onRefresh();
+                  } catch (err) {
+                    onMessage(`${t('Lỗi lưu cấu hình: ', 'Failed to save settings: ')}${err instanceof Error ? err.message : String(err)}`, 'error');
+                  }
+                }}
+              />
+              {t('Tự động cập nhật ứng dụng (Auto update)', 'Automatically update application (Auto update)')}
+            </label>
+            <Button
+              variant="primary"
+              loading={updatingApp || snapshot.app_update?.state === 'checking' || snapshot.app_update?.state === 'downloading'}
+              disabled={updatingApp || snapshot.app_update?.state === 'checking' || snapshot.app_update?.state === 'downloading'}
+              onClick={async () => {
+                setUpdatingApp(true);
+                try {
+                  const res = await request<{ current_version: string; latest_version: string; state: string }>('app.update');
+                  await onRefresh();
+                  if (res.state === 'ready') {
+                    onMessage(
+                      t(
+                        `Đã tải và cài đặt CamouManager ${res.latest_version}. Tắt và mở lại ứng dụng để hoàn tất cập nhật.`,
+                        `Downloaded and installed CamouManager ${res.latest_version}. Close and reopen the app to finish updating.`
+                      ),
+                      'info'
+                    );
+                  } else {
+                    onMessage(
+                      t(
+                        `CamouManager đã ở phiên bản mới nhất (v${res.current_version}).`,
+                        `CamouManager is already up to date (v${res.current_version}).`
+                      ),
+                      'info'
+                    );
+                  }
+                } catch (err) {
+                  onMessage(`${t('Lỗi cập nhật ứng dụng: ', 'App update failed: ')}${err instanceof Error ? err.message : String(err)}`, 'error');
+                } finally {
+                  setUpdatingApp(false);
+                }
+              }}
+            >
+              {snapshot.app_update?.state === 'ready'
+                ? t('Đã cài đặt (Chờ mở lại)', 'Installed (Restart to apply)')
+                : t('Cập nhật ứng dụng', 'Update App')}
+            </Button>
+          </div>
         </div>
       </div>
 

@@ -121,7 +121,7 @@ impl Store {
     }
     pub fn settings(&self) -> Result<Value> {
         let raw: Option<String> = self.db.lock().query_row("SELECT payload FROM settings WHERE id=1", [], |row| row.get(0)).optional()?;
-        let mut defaults = json!({"max_running":4,"default_proxy_id":"","auto_assign_proxy":false,"backup_interval_hours":0,"backup_retention":10,"auto_check_updates":true,"update_check_hours":24,"auto_download_updates":false,"last_scheduled_backup_at":"","last_update_check_at":"","default_startup_url":"https://duckduckgo.com","default_search_engine":"DuckDuckGo"});
+        let mut defaults = json!({"max_running":4,"default_proxy_id":"","auto_assign_proxy":false,"backup_interval_hours":0,"backup_retention":10,"auto_check_updates":true,"update_check_hours":24,"auto_download_updates":false,"auto_update_app":false,"last_scheduled_backup_at":"","last_update_check_at":"","default_startup_url":"https://duckduckgo.com","default_search_engine":"DuckDuckGo"});
         if let Some(raw) = raw {
             let saved: Map<String, Value> = serde_json::from_str(&raw)?;
             defaults.as_object_mut().expect("object defaults").extend(saved);
@@ -142,7 +142,7 @@ impl Store {
             let value = target[key].as_i64().ok_or_else(|| anyhow!("{key} phải là số nguyên"))?;
             if !(low..=high).contains(&value) { bail!("{key} phải trong khoảng {low}–{high}"); }
         }
-        for key in ["auto_assign_proxy", "auto_check_updates", "auto_download_updates"] {
+        for key in ["auto_assign_proxy", "auto_check_updates", "auto_download_updates", "auto_update_app"] {
             if !target[key].is_boolean() { bail!("{key} phải là boolean"); }
         }
         for key in ["default_proxy_id", "last_scheduled_backup_at", "last_update_check_at", "default_startup_url", "default_search_engine"] {

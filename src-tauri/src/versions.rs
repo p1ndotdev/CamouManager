@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 const GITHUB_RELEASES_URL: &str = "https://api.github.com/repos/daijro/camoufox/releases";
+const APP_RELEASES_URL: &str = "https://api.github.com/repos/p1ndotdev/CamouManager/releases";
 const MAX_UNCOMPRESSED_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB safe limit
 
 /// Check if asset name corresponds to Windows x86_64 build.
@@ -310,6 +311,11 @@ pub struct Versions {
     pause_epoch: AtomicU64,
     cancel_requested: Arc<AtomicBool>,
     wake_cond: Arc<(Mutex<()>, Condvar)>,
+    app_update: Mutex<Value>,
+    app_update_active: Arc<AtomicBool>,
+    pending_app_exe: Mutex<Option<(PathBuf, PathBuf)>>,
+    #[cfg(test)]
+    app_exe_override: Mutex<Option<PathBuf>>,
     #[cfg(test)]
     cleanup_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -320,6 +326,9 @@ impl Versions {
     }
 
     pub fn with_transport(store: Arc<crate::store::Store>, transport: Arc<dyn Transport>) -> Self {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = fs::remove_file(exe.with_extension("exe.old"));
+        }
         Self {
             store,
             transport,
@@ -336,6 +345,16 @@ impl Versions {
             pause_epoch: AtomicU64::new(0),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             wake_cond: Arc::new((Mutex::new(()), Condvar::new())),
+            app_update: Mutex::new(json!({
+                "current_version": env!("CARGO_PKG_VERSION"),
+                "latest_version": "",
+                "state": "idle",
+                "error": "",
+            })),
+            app_update_active: Arc::new(AtomicBool::new(false)),
+            pending_app_exe: Mutex::new(None),
+            #[cfg(test)]
+            app_exe_override: Mutex::new(None),
             #[cfg(test)]
             cleanup_hook: None,
         }
@@ -361,7 +380,7 @@ impl Versions {
 
     /// Check if an installation worker is currently active.
     pub fn is_active(&self) -> bool {
-        if self.active_worker.load(Ordering::SeqCst) {
+        if self.active_worker.load(Ordering::SeqCst) || self.app_update_active.load(Ordering::SeqCst) {
             return true;
         }
         let st = self.status.lock();
@@ -1346,6 +1365,308 @@ impl Versions {
         }
 
         Ok(result)
+    }
+
+    pub fn app_update_status(&self) -> Value {
+        self.app_update.lock().clone()
+    }
+
+    pub fn apply_pending_app_update_on_exit(&self) {
+        if let Some((new_exe, target_exe)) = self.pending_app_exe.lock().take() {
+            if new_exe.exists() {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    let script = format!(
+                        "for /L %i in (1,1,15) do @(move /Y \"{}\" \"{}\" >nul 2>&1 && exit /b 0 || ping 127.0.0.1 -n 2 >nul)",
+                        new_exe.display(),
+                        target_exe.display()
+                    );
+                    let _ = std::process::Command::new("cmd.exe")
+                        .args(["/C", &script])
+                        .creation_flags(0x0800_0000)
+                        .spawn();
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = fs::rename(&new_exe, &target_exe);
+                }
+            }
+        }
+    }
+
+    pub fn update_app(&self) -> Result<Value> {
+        if self
+            .app_update_active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(anyhow!("Đang kiểm tra hoặc tải bản cập nhật ứng dụng"));
+        }
+        struct FlagGuard(Arc<AtomicBool>);
+        impl Drop for FlagGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::SeqCst);
+            }
+        }
+        let _guard = FlagGuard(self.app_update_active.clone());
+
+        if self.app_update.lock().get("state").and_then(Value::as_str) == Some("ready") {
+            return Ok(self.app_update_status());
+        }
+        {
+            let mut st = self.app_update.lock();
+            st["state"] = json!("checking");
+            st["error"] = json!("");
+        }
+        match self.run_app_update() {
+            Ok(val) => Ok(val),
+            Err(e) => {
+                let mut st = self.app_update.lock();
+                st["state"] = json!("error");
+                st["error"] = json!(e.to_string());
+                Err(e)
+            }
+        }
+    }
+
+    fn run_app_update(&self) -> Result<Value> {
+        let mut headers = vec![
+            ("User-Agent".to_string(), "CamouManager".to_string()),
+            ("Accept".to_string(), "application/vnd.github.v3+json".to_string()),
+        ];
+        if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+            if !token.is_empty() {
+                headers.push(("Authorization".to_string(), format!("Bearer {}", token)));
+            }
+        }
+        let resp = self
+            .transport
+            .execute(HttpRequest {
+                url: APP_RELEASES_URL.to_string(),
+                headers,
+            })
+            .context("Không thể kết nối GitHub để kiểm tra cập nhật ứng dụng")?;
+        if resp.status != 200 {
+            return Err(anyhow!("GitHub releases trả về mã lỗi {}", resp.status));
+        }
+        let mut body_str = String::new();
+        let mut reader = resp.body;
+        reader.read_to_string(&mut body_str)?;
+        let releases_data: Value = serde_json::from_str(&body_str)?;
+        let mut candidates: Vec<&Value> = releases_data
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter(|r| !r.get("draft").and_then(Value::as_bool).unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_default();
+        candidates.sort_by(|a, b| {
+            let ta = a.get("tag_name").and_then(Value::as_str).unwrap_or("");
+            let tb = b.get("tag_name").and_then(Value::as_str).unwrap_or("");
+            parse_version_key(tb).cmp(&parse_version_key(ta))
+        });
+
+        let current_ver = self
+            .app_update
+            .lock()
+            .get("current_version")
+            .and_then(Value::as_str)
+            .unwrap_or(env!("CARGO_PKG_VERSION"))
+            .to_string();
+
+        let Some(latest_rel) = candidates.first().copied() else {
+            let mut st = self.app_update.lock();
+            st["state"] = json!("up_to_date");
+            st["latest_version"] = json!(current_ver);
+            return Ok(st.clone());
+        };
+        let tag_name = latest_rel.get("tag_name").and_then(Value::as_str).unwrap_or("");
+        if tag_name.is_empty() || parse_version_key(tag_name) <= parse_version_key(&current_ver) {
+            let mut st = self.app_update.lock();
+            st["state"] = json!("up_to_date");
+            st["latest_version"] = json!(current_ver);
+            return Ok(st.clone());
+        }
+
+        let assets = latest_rel
+            .get("assets")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Bản phát hành {} không có tệp đính kèm", tag_name))?;
+        let zip_asset = assets
+            .iter()
+            .find(|a| {
+                let n = a.get("name").and_then(Value::as_str).unwrap_or("").to_lowercase();
+                n.ends_with(".zip") && (n.contains("portable") || n.contains("camoumanager"))
+            })
+            .ok_or_else(|| anyhow!("Không tìm thấy gói cập nhật .zip trong bản phát hành {}", tag_name))?;
+
+        let asset_name = zip_asset.get("name").and_then(Value::as_str).unwrap_or("");
+        let asset_url = zip_asset
+            .get("browser_download_url")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let parsed_url = Url::parse(asset_url).context("URL tải bản cập nhật không hợp lệ")?;
+        let is_test_allowed = cfg!(test)
+            && matches!(parsed_url.host_str(), Some("127.0.0.1" | "localhost" | "example.com"));
+        if parsed_url.scheme() != "https" && !is_test_allowed {
+            return Err(anyhow!("URL tải bản cập nhật bắt buộc phải dùng HTTPS"));
+        }
+
+        let mut expected_sha256 = String::new();
+        if let Some(digest) = zip_asset.get("digest").and_then(Value::as_str) {
+            if let Some(hex) = digest.strip_prefix("sha256:").or_else(|| digest.strip_prefix("SHA256:")) {
+                expected_sha256 = hex.trim().to_lowercase();
+            }
+        }
+        if expected_sha256.is_empty() {
+            if let Some(sums_asset) = assets.iter().find(|a| {
+                let n = a.get("name").and_then(Value::as_str).unwrap_or("");
+                n.eq_ignore_ascii_case("SHA256SUMS.txt")
+                    || n.eq_ignore_ascii_case(&format!("{asset_name}.sha256"))
+            }) {
+                if let Some(sums_url) = sums_asset.get("browser_download_url").and_then(Value::as_str) {
+                    if let Ok(s_resp) = self.transport.execute(HttpRequest {
+                        url: sums_url.to_string(),
+                        headers: vec![("User-Agent".to_string(), "CamouManager".to_string())],
+                    }) {
+                        if s_resp.status == 200 {
+                            let mut text = String::new();
+                            let mut r = s_resp.body;
+                            if r.read_to_string(&mut text).is_ok() {
+                                static SHA_RE: LazyLock<regex::Regex> =
+                                    LazyLock::new(|| regex::Regex::new(r"(?i)\b[a-f0-9]{64}\b").unwrap());
+                                for line in text.lines() {
+                                    if line.contains(asset_name) {
+                                        if let Some(m) = SHA_RE.find(line) {
+                                            expected_sha256 = m.as_str().to_lowercase();
+                                            break;
+                                        }
+                                    }
+                                }
+                                if expected_sha256.is_empty() {
+                                    if let Some(m) = SHA_RE.find(&text) {
+                                        expected_sha256 = m.as_str().to_lowercase();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!("Thiếu mã kiểm tra SHA256 hợp lệ cho bản cập nhật {}", tag_name));
+        }
+
+        {
+            let mut st = self.app_update.lock();
+            st["state"] = json!("downloading");
+            st["latest_version"] = json!(tag_name);
+        }
+
+        let dl_resp = self.transport.execute(HttpRequest {
+            url: asset_url.to_string(),
+            headers: vec![("User-Agent".to_string(), "CamouManager".to_string())],
+        })?;
+        if dl_resp.status != 200 {
+            return Err(anyhow!("Tải gói cập nhật thất bại với mã {}", dl_resp.status));
+        }
+
+        let temp_dir = tempfile::Builder::new().prefix("cm_app_upd_").tempdir()?;
+        let zip_path = temp_dir.path().join("update.zip");
+        let mut zip_file = File::create(&zip_path)?;
+        let mut hasher = Sha256::new();
+        let mut stream = dl_resp.body;
+        let mut buf = [0u8; 64 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = stream.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+            if total > 512 * 1024 * 1024 {
+                return Err(anyhow!("Gói cập nhật vượt quá giới hạn 512 MiB"));
+            }
+            hasher.update(&buf[..n]);
+            zip_file.write_all(&buf[..n])?;
+        }
+        zip_file.flush()?;
+        drop(zip_file);
+
+        let actual_sha256 = hex::encode(hasher.finalize()).to_lowercase();
+        if actual_sha256 != expected_sha256 {
+            return Err(anyhow!("SHA256 gói cập nhật không khớp"));
+        }
+
+        #[cfg(test)]
+        let target_exe = self
+            .app_exe_override
+            .lock()
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(std::env::current_exe)?;
+        #[cfg(not(test))]
+        let target_exe = std::env::current_exe()?;
+
+        let new_exe = target_exe.with_extension("exe.new");
+        let mut archive = zip::ZipArchive::new(File::open(&zip_path)?)?;
+        let mut found_exe = false;
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i)?;
+            let entry_name = entry.name().rsplit(['/', '\\']).next().unwrap_or("");
+            if entry_name.eq_ignore_ascii_case("CamouManager.exe") {
+                let mut out = File::create(&new_exe)?;
+                let copied = std::io::copy(&mut entry, &mut out)?;
+                out.flush()?;
+                if copied < 2 {
+                    let _ = fs::remove_file(&new_exe);
+                    return Err(anyhow!("Tệp CamouManager.exe trong gói cập nhật bị hỏng"));
+                }
+                found_exe = true;
+                break;
+            }
+        }
+        if !found_exe {
+            return Err(anyhow!("Không tìm thấy CamouManager.exe trong gói cập nhật"));
+        }
+        let mut magic = [0u8; 2];
+        File::open(&new_exe)?.read_exact(&mut magic)?;
+        if &magic != b"MZ" {
+            let _ = fs::remove_file(&new_exe);
+            return Err(anyhow!("Tệp thực thi cập nhật không phải định dạng PE hợp lệ"));
+        }
+
+        let old_exe = target_exe.with_extension("exe.old");
+        let _ = fs::remove_file(&old_exe);
+        if target_exe.exists() {
+            if fs::rename(&target_exe, &old_exe).is_ok() {
+                if let Err(e) = fs::rename(&new_exe, &target_exe) {
+                    let _ = fs::rename(&old_exe, &target_exe);
+                    let _ = fs::remove_file(&new_exe);
+                    return Err(anyhow!("Không thể ghi tệp cập nhật mới: {e}"));
+                }
+                *self.pending_app_exe.lock() = None;
+            } else {
+                *self.pending_app_exe.lock() = Some((new_exe, target_exe));
+            }
+        } else {
+            fs::rename(&new_exe, &target_exe)?;
+            *self.pending_app_exe.lock() = None;
+        }
+
+        let _ = self.store.log(
+            "INFO",
+            &format!("Đã tải và cài đặt bản cập nhật CamouManager {tag_name}; chờ tắt mở lại ứng dụng"),
+            "",
+        );
+        let mut st = self.app_update.lock();
+        st["state"] = json!("ready");
+        st["latest_version"] = json!(tag_name);
+        st["error"] = json!("");
+        Ok(st.clone())
     }
 }
 
@@ -2922,6 +3243,70 @@ pub mod tests {
         assert!(res.is_err());
         assert_eq!(fs::read(&external)?, b"keep");
         assert_eq!(store.get("versions", "v135.0.0")?, Some(rec));
+        Ok(())
+    }
+
+    #[test]
+    fn test_app_self_update_downloads_verifies_and_replaces_exe() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = Arc::new(crate::store::Store::open(temp_dir.path())?);
+        let exe_path = temp_dir.path().join("CamouManager.exe");
+        fs::write(&exe_path, b"MZ-old-binary")?;
+
+        let mut zip_buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut zip_buf));
+            zip.start_file("CamouManager/CamouManager.exe", SimpleFileOptions::default())?;
+            zip.write_all(b"MZ-new-binary-v99")?;
+            zip.finish()?;
+        }
+        let sha256 = hex::encode(Sha256::digest(&zip_buf));
+        let zip_bytes = zip_buf.clone();
+
+        struct AppMockTransport {
+            zip_bytes: Vec<u8>,
+            sha256: String,
+        }
+        impl Transport for AppMockTransport {
+            fn execute(&self, req: HttpRequest) -> Result<HttpResponse> {
+                if req.url == APP_RELEASES_URL {
+                    let body = json!([{
+                        "tag_name": "v99.0.0",
+                        "draft": false,
+                        "assets": [{
+                            "name": "CamouManager-Portable-99.0.0.zip",
+                            "browser_download_url": "https://127.0.0.1/CamouManager-Portable-99.0.0.zip",
+                            "digest": format!("sha256:{}", self.sha256)
+                        }]
+                    }])
+                    .to_string()
+                    .into_bytes();
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: Box::new(std::io::Cursor::new(body)),
+                    })
+                } else {
+                    Ok(HttpResponse {
+                        status: 200,
+                        headers: vec![],
+                        body: Box::new(std::io::Cursor::new(self.zip_bytes.clone())),
+                    })
+                }
+            }
+        }
+
+        let versions = Versions::with_transport(
+            store,
+            Arc::new(AppMockTransport { zip_bytes, sha256 }),
+        );
+        *versions.app_exe_override.lock() = Some(exe_path.clone());
+
+        let st = versions.update_app()?;
+        assert_eq!(st["state"], "ready");
+        assert_eq!(st["latest_version"], "v99.0.0");
+        assert_eq!(fs::read(&exe_path)?, b"MZ-new-binary-v99");
+        assert_eq!(fs::read(exe_path.with_extension("exe.old"))?, b"MZ-old-binary");
         Ok(())
     }
 }

@@ -138,6 +138,13 @@ impl Profiles {
         if self.runtime.is_running(id) { bail!("Hồ sơ '{id}' đang chạy, không thể thay đổi"); }
         Ok(record)
     }
+    fn version_major(&self, ver: &str) -> Result<u32> {
+        safe_component(ver)?;
+        if let Some(installed) = self.store.get("versions", ver)? {
+            return Ok(crate::runtime::resolve_browser_major(Path::new(string(&installed, "path")), ver));
+        }
+        browser_major(ver)
+    }
     fn validate(&self, data: &Value, current: Option<&Value>) -> Result<Value> {
         let mut record = validate_profile_schema(data, current)?;
         let proxy_id = string(&record, "proxy_id");
@@ -206,7 +213,7 @@ impl Profiles {
             record["fingerprint"] = self.fingerprints.generate(&record)?;
             record["fingerprint_meta"]["regenerated_at"] = json!(utcnow());
         } else if old["browser_version"] != record["browser_version"] && !string(&record,"browser_version").is_empty() {
-            let major = browser_major(string(&record,"browser_version"))?;
+            let major = self.version_major(string(&record,"browser_version"))?;
             self.fingerprints.retarget_version(&mut record["fingerprint"], major)?;
         }
         self.directories(id)?;
@@ -255,9 +262,19 @@ impl Profiles {
     }
     pub fn set_many(&self, ids: &[String], key: &str, value: Value) -> Result<()> {
         let _guard = self.store.operation.lock();
-        if !["proxy_id","tags","group"].contains(&key) { bail!("Trường thay đổi hàng loạt không hợp lệ"); }
+        if !["proxy_id","tags","group","browser_version"].contains(&key) { bail!("Trường thay đổi hàng loạt không hợp lệ"); }
         let data = json!({key:value});
-        let records = ids.iter().map(|id| self.validate(&data, Some(&self.closed(id)?))).collect::<Result<Vec<_>>>()?;
+        let records = ids.iter().collect::<BTreeSet<_>>().into_iter().map(|id| {
+            let old = self.closed(id)?;
+            let mut record = self.validate(&data, Some(&old))?;
+            if old["browser_version"] != record["browser_version"] && !string(&record,"browser_version").is_empty()
+                && record.get("fingerprint").and_then(Value::as_object).is_some_and(|fp| !fp.is_empty())
+            {
+                let major = self.version_major(string(&record,"browser_version"))?;
+                self.fingerprints.retarget_version(&mut record["fingerprint"], major)?;
+            }
+            Ok(record)
+        }).collect::<Result<Vec<_>>>()?;
         self.store.put_many("profiles", records)?;
         Ok(())
     }

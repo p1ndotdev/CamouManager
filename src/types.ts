@@ -95,6 +95,7 @@ export interface Settings {
   auto_check_updates?: boolean;
   update_check_hours: number;
   auto_download_updates: boolean;
+  auto_update_app?: boolean;
   last_scheduled_backup_at?: string;
   last_update_check_at?: string;
   [key: string]: unknown;
@@ -142,6 +143,13 @@ export interface FingerprintData {
   source?: string;
 }
 
+export interface AppUpdateStatus {
+  current_version: string;
+  latest_version: string;
+  state: 'idle' | 'checking' | 'downloading' | 'ready' | 'up_to_date' | 'error';
+  error: string;
+}
+
 export interface AppSnapshot {
   profiles: Profile[];
   proxies: Proxy[];
@@ -150,6 +158,7 @@ export interface AppSnapshot {
   fingerprint_data: FingerprintData;
   root: string;
   backup: BackupState;
+  app_update?: AppUpdateStatus;
 }
 
 export type InstallationState =
@@ -186,6 +195,7 @@ export interface StatusEvent {
   backup: BackupState;
   busy: number;
   installation?: InstallationStatus;
+  app_update?: AppUpdateStatus;
 }
 
 export interface PageProps {

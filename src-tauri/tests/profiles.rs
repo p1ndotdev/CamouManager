@@ -281,3 +281,28 @@ fn app_language_selection_and_validation() {
     assert!(backend.request("app.language", json!({}), None).is_err());
     assert!(backend.english.load(std::sync::atomic::Ordering::Relaxed));
 }
+
+#[test]
+fn bulk_set_version_retargets_ua_preserves_identity_and_rolls_back_on_error() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Backend::open(root.path().to_owned()).unwrap();
+    let first = create(&backend, "FirstVer");
+    let second = create(&backend, "SecondVer");
+    let id1 = first["id"].as_str().unwrap();
+    let id2 = second["id"].as_str().unwrap();
+    let seed1 = first["fingerprint"]["audio:seed"].clone();
+
+    assert!(backend.request("profile.set_version", json!({"ids": [id1, id2], "browser_version": "not-a-version"}), None).is_err());
+    assert_eq!(backend.profiles.get(id1).unwrap()["browser_version"], "");
+
+    backend.request("profile.set_version", json!({"ids": [id1, id2], "browser_version": "v158.0.1-beta.1"}), None).unwrap();
+    for id in [id1, id2] {
+        let updated = backend.profiles.get(id).unwrap();
+        assert_eq!(updated["browser_version"], "v158.0.1-beta.1");
+        assert!(updated["fingerprint"]["navigator.userAgent"].as_str().unwrap().contains("Firefox/158.0"));
+    }
+    assert_eq!(backend.profiles.get(id1).unwrap()["fingerprint"]["audio:seed"], seed1);
+
+    backend.request("profile.set_version", json!({"ids": [id1], "browser_version": ""}), None).unwrap();
+    assert_eq!(backend.profiles.get(id1).unwrap()["browser_version"], "");
+}

@@ -43,7 +43,7 @@ impl Backend {
     pub fn status(&self) -> Result<Value> {
         let statuses = self.runtime.status()?;
         let running = statuses.as_object().map(|m| m.values().filter(|s| matches!(string(s,"state"),"running"|"starting"|"stopping")).count()).unwrap_or(0);
-        Ok(json!({"statuses":statuses,"running_count":running,"max_running":self.store.settings()?["max_running"],"backup":self.backups.state()?,"installation":self.versions.status(),"busy":self.activity.lock().busy}))
+        Ok(json!({"statuses":statuses,"running_count":running,"max_running":self.store.settings()?["max_running"],"backup":self.backups.state()?,"installation":self.versions.status(),"app_update":self.versions.app_update_status(),"busy":self.activity.lock().busy}))
     }
     pub fn snapshot(&self) -> Result<Value> {
         let statuses = self.runtime.status()?;
@@ -59,7 +59,7 @@ impl Backend {
             if let Some(status) = statuses.get(&id).and_then(Value::as_object) { map.extend(status.clone()); }
             else { map.insert("state".into(),json!("stopped")); }
         }
-        Ok(json!({"profiles":profiles,"proxies":proxies.iter().map(summary).collect::<Vec<_>>(),"versions":self.versions.installed()?,"settings":self.store.settings()?,"fingerprint_data":self.fingerprints.info()?,"root":self.store.root,"backup":self.backups.state()?,"installation":self.versions.status()}))
+        Ok(json!({"profiles":profiles,"proxies":proxies.iter().map(summary).collect::<Vec<_>>(),"versions":self.versions.installed()?,"settings":self.store.settings()?,"fingerprint_data":self.fingerprints.info()?,"root":self.store.root,"backup":self.backups.state()?,"installation":self.versions.status(),"app_update":self.versions.app_update_status()}))
     }
     pub fn shutdown(&self) -> Result<()> {
         {
@@ -69,6 +69,7 @@ impl Backend {
         }
         if let Err(error) = self.runtime.stop_all() { self.activity.lock().shutdown = false; return Err(error); }
         self.stopped.store(true,Ordering::Release);
+        self.versions.apply_pending_app_update_on_exit();
         Ok(())
     }
     fn begin(&self, mutation: bool) -> Result<Operation<'_>> {
@@ -138,6 +139,7 @@ impl Backend {
             "profile.assign_proxy" => { self.profiles.set_many(&ids()?,"proxy_id",json!(string(&params,"proxy_id")))?; Ok(Value::Null) },
             "profile.set_tags" => { self.profiles.set_many(&ids()?,"tags",params["tags"].clone())?; Ok(Value::Null) },
             "profile.set_group" => { self.profiles.set_many(&ids()?,"group",json!(string(&params,"group")))?; Ok(Value::Null) },
+            "profile.set_version" => { self.profiles.set_many(&ids()?,"browser_version",params.get("browser_version").cloned().unwrap_or_else(|| json!("")))?; Ok(Value::Null) },
             "profile.regenerate" => self.profiles.regenerate(id()?),
             "profile.import_extension" => self.profiles.import_extension(id()?,Path::new(require_str(&params,"path")?)).map(|p| json!(p)),
             "profile.remove_extension" => { self.profiles.remove_extension(id()?,require_str(&params,"name")?)?; Ok(Value::Null) },
@@ -182,6 +184,7 @@ impl Backend {
                 Ok(result)
             },
             "fingerprint_data.update" => self.fingerprints.update(),
+            "app.update" => self.versions.update_app(),
             "logs.list" => self.store.logs().map(|p| json!(p)),
             "logs.export" => { self.store.export_logs(Path::new(require_str(&params,"path")?))?; Ok(Value::Null) },
             _ => bail!("Phương thức không được hỗ trợ: {method}"),
@@ -193,7 +196,7 @@ impl Backend {
                     "backup.restore" => &["profiles","proxies","backups"],
                     "proxy.delete" => &["proxies","profiles","settings"],
                     "proxy.save"|"proxy.import"|"proxy.check"|"proxy.check_all" => &["proxies"],
-                    "settings.save" => &["settings"],
+                    "settings.save"|"app.update" => &["settings"],
                     "versions.install"|"versions.delete"|"versions.check_updates" => &["versions","profiles"],
                     "fingerprint_data.update" => &["fingerprint_data"],
                     "backup.create"|"backup.delete" => &["backups"],
@@ -211,6 +214,7 @@ impl Backend {
         std::thread::spawn(move || {
             let mut last_tick = Instant::now() - Duration::from_secs(60);
             let scheduled = Arc::new(AtomicBool::new(false));
+            let app_checked = Arc::new(AtomicBool::new(false));
             loop {
                 std::thread::sleep(Duration::from_secs(2));
                 let Some(backend) = weak.upgrade() else { break; };
@@ -225,6 +229,7 @@ impl Backend {
                 let worker = backend.clone();
                 let app = app.clone();
                 let scheduled = scheduled.clone();
+                let app_checked = app_checked.clone();
                 std::thread::spawn(move || {
                     (|| {
                     let Ok(_operation) = worker.begin(true) else { return; };
@@ -236,6 +241,19 @@ impl Backend {
                     let settings = match worker.store.settings() { Ok(v) => v, Err(_) => return };
                     let hours = settings["update_check_hours"].as_u64().unwrap_or(24);
                     let due = chrono::DateTime::parse_from_rfc3339(string(&settings,"last_update_check_at")).map(|last| (chrono::Utc::now() - last.with_timezone(&chrono::Utc)).num_seconds() >= hours.saturating_mul(3600).min(i64::MAX as u64) as i64).unwrap_or(true);
+                    if settings["auto_update_app"].as_bool().unwrap_or(false) && !worker.versions.is_active() && worker.versions.app_update_status()["state"] != "ready" && !app_checked.swap(true, Ordering::AcqRel) {
+                        if let Ok(upd) = worker.versions.update_app() {
+                            if string(&upd, "state") == "ready" {
+                                let ver = string(&upd, "latest_version");
+                                let msg = if worker.english.load(Ordering::Relaxed) {
+                                    format!("CamouManager {ver} has been downloaded and installed. Close and reopen the app to finish updating.")
+                                } else {
+                                    format!("Đã tự động tải và cài đặt CamouManager {ver}. Tắt và mở lại ứng dụng để hoàn tất cập nhật.")
+                                };
+                                let _ = app.emit("app:notice", json!({"level": "info", "message": msg}));
+                            }
+                        }
+                    }
                     if due && hours > 0 && settings["auto_check_updates"].as_bool().unwrap_or(false) && !worker.versions.is_active() {
                         match worker.versions.check_updates() {
                             Ok(result) => {

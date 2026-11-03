@@ -377,10 +377,6 @@ pub fn build_default_prefs(
         prefs.insert("gfx.font_rendering.fallback.async".into(), json!(false));
     }
 
-    prefs.insert(
-        "dom.quotaManager.temporaryStorage.fixedLimit".into(),
-        json!(i32::MAX),
-    );
 
     let dnt_enabled = config
         .get("navigator.doNotTrack")
@@ -465,6 +461,7 @@ pub fn build_default_prefs(
     prefs.insert("browser.tabs.warnOnCloseOtherTabs".into(), json!(false));
     prefs.insert("browser.shell.checkDefaultBrowser".into(), json!(false));
 
+    prefs.insert("toolkit.legacyUserProfileCustomizations.stylesheets".into(), json!(true));
     if has_bookmarks {
         prefs.insert("browser.toolbars.bookmarks.visibility".into(), json!("always"));
     }
@@ -610,19 +607,11 @@ pub fn prepare_xulstore_window(browser_dir: &Path, w: i64, h: i64, x: i64, y: i6
 
 const MANAGED_CHROME_CSS: &str = ":root[remotecontrol] #remote-control-box { display: none !important; }\n:root[remotecontrol] .urlbar-background { background-image: none !important; }\n";
 
-pub fn prepare_browser_chrome_css(executable_path: &Path) -> Result<()> {
+fn append_managed_chrome_css(parent: &Path, filename: &str) -> Result<()> {
     use std::io::{Read, Write};
 
-    let parent = executable_path
-        .parent()
-        .ok_or_else(|| anyhow!("Browser executable has no parent directory"))?;
-    let parent = if parent.as_os_str().is_empty() {
-        Path::new(".")
-    } else {
-        parent
-    };
     reject_link(parent)?;
-    let path = parent.join("chrome.css");
+    let path = parent.join(filename);
     reject_link(&path)?;
 
     let old = match fs::File::open(&path) {
@@ -630,7 +619,7 @@ pub fn prepare_browser_chrome_css(executable_path: &Path) -> Result<()> {
             let mut text = String::new();
             file.take(4 * 1024 * 1024 + 1).read_to_string(&mut text)?;
             if text.len() > 4 * 1024 * 1024 {
-                bail!("chrome.css exceeds 4 MiB");
+                bail!("{filename} exceeds 4 MiB");
             }
             text
         }
@@ -651,6 +640,26 @@ pub fn prepare_browser_chrome_css(executable_path: &Path) -> Result<()> {
     file.as_file().sync_all()?;
     file.persist(&path)?;
     Ok(())
+}
+
+pub fn prepare_browser_chrome_css(executable_path: &Path) -> Result<()> {
+    let parent = executable_path
+        .parent()
+        .ok_or_else(|| anyhow!("Browser executable has no parent directory"))?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    append_managed_chrome_css(parent, "chrome.css")
+}
+
+pub fn prepare_profile_user_chrome_css(browser_dir: &Path) -> Result<()> {
+    reject_link(browser_dir)?;
+    let chrome_dir = browser_dir.join("chrome");
+    reject_link(&chrome_dir)?;
+    fs::create_dir_all(&chrome_dir)?;
+    append_managed_chrome_css(&chrome_dir, "userChrome.css")
 }
 
 pub fn ensure_distribution_policies(exe_path: &Path, search_engine: &str) -> Result<()> {
@@ -752,6 +761,7 @@ fn prepare_webrtc_pref(browser_dir: &Path, prefs: &Map<String, Value>) -> Result
         if key.starts_with("media.peerconnection.")
             || key.starts_with("network.proxy.")
             || key.starts_with("media.webrtc.")
+            || key == "toolkit.legacyUserProfileCustomizations.stylesheets"
         {
             writeln!(file, "user_pref({}, {}); // CamouManager WebRTC", serde_json::to_string(key)?, value)?;
         }
@@ -1980,6 +1990,7 @@ impl Runtime {
             if !headless {
                 cmd.arg("-foreground");
                 prepare_browser_chrome_css(&exe_path)?;
+                prepare_profile_user_chrome_css(&browser_dir)?;
                 let launch_w = config_map
                     .get("window.outerWidth")
                     .and_then(Value::as_i64)
@@ -3664,6 +3675,12 @@ mod tests {
         let content_after_second = fs::read_to_string(&css_path).unwrap();
         assert_eq!(content_after_first, content_after_second);
 
+
+        let profile_browser_dir = dir.path().join("profile_browser");
+        fs::create_dir_all(&profile_browser_dir).unwrap();
+        prepare_profile_user_chrome_css(&profile_browser_dir).unwrap();
+        let user_chrome = fs::read_to_string(profile_browser_dir.join("chrome/userChrome.css")).unwrap();
+        assert!(user_chrome.contains(MANAGED_CHROME_CSS));
         let blocked = dir.path().join("not_a_dir");
         fs::write(&blocked, "file").unwrap();
         assert!(prepare_browser_chrome_css(&blocked.join("camoufox.exe")).is_err());

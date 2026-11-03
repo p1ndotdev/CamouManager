@@ -20,6 +20,10 @@ Yêu cầu **Windows 10/11 x64** và **Microsoft Edge WebView2 Runtime**.
 
 Đổi Tiếng Việt / English tại **Cài đặt → Ngôn ngữ giao diện**. Lựa chọn được ghi nhớ, không thay đổi locale của fingerprint. Log và chi tiết lỗi kỹ thuật giữ nguyên ngôn ngữ gốc.
 
+### Cập nhật lên v1.0.6
+
+Bản v1.0.6 bổ sung thao tác đổi phiên bản Camoufox hàng loạt khi chọn 1 hoặc tất cả hồ sơ (tự động đồng bộ lại Firefox major version trong `navigator.userAgent` / `headers.User-Agent`), thêm nút cập nhật ứng dụng trực tiếp từ GitHub kèm tùy chọn tự động cập nhật (`auto_update_app`, tự tải và áp dụng khi tắt mở lại ứng dụng), khắc phục triệt để việc hiện biểu tượng robot và dải sọc đỏ điều khiển từ xa trên Camoufox v158+ qua `<browser_dir>/chrome/userChrome.css` kết hợp khóa `toolkit.legacyUserProfileCustomizations.stylesheets = true`, đồng thời để Gecko tự tính `navigator.storage.estimate().quota` theo ổ đĩa thật thay vì ghim cứng `fixedLimit`.
+
 ### Cập nhật lên v1.0.5
 
 Bản v1.0.5 đồng bộ kích thước cửa sổ và màn hình ảo (`screen.width/height`), tự động nhận diện màn hình máy thật (`host_work_area`) để mở cửa sổ vừa vặn và căn giữa; mở khóa co giãn giao diện web responsive khi kéo thả viền cửa sổ. Bổ sung tùy chọn độ phân giải màn hình tùy chỉnh hoặc ngẫu nhiên, cảnh báo lệch vị trí Proxy kèm nút đồng bộ 1 chạm, mặc định mở và tìm kiếm bằng DuckDuckGo (có thể cấu hình trong Cài đặt và từng hồ sơ), tối ưu chuẩn hóa CPU theo số luồng máy thật (chuẩn Windows Task Manager), cải tiến giao diện chọn phiên bản và nút thao tác danh sách hồ sơ. Bổ sung cơ chế ẩn dải đỏ và biểu tượng robot điều khiển từ xa (RemoteAgent/BiDi) trực tiếp tại tệp `chrome.css` ở thư mục gốc cài đặt trình duyệt (bảo lưu CSS sẵn có và idempotent, thay thế việc ghi profile `userChrome.css` không hiệu lực).

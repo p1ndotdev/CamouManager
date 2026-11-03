@@ -1,6 +1,6 @@
 [package]
 name = "camoumanager"
-version = "1.0.6"
+version = "1.0.7"
 description = "Local Camoufox profile manager"
 authors = ["CamouManager"]
 license = "GPL-3.0-only"

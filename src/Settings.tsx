@@ -597,7 +597,7 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
             <div style={{ fontSize: 12 }}>
-              <strong>CamouManager v{snapshot.app_update?.current_version || '1.0.6'}</strong>
+              <strong>CamouManager v{snapshot.app_update?.current_version || '1.0.7'}</strong>
               {snapshot.app_update?.state === 'ready' ? (
                 <div style={{ color: 'var(--success)', marginTop: 2 }}>
                   {t(
@@ -618,6 +618,15 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
                   try {
                     await request('settings.save', { data: { auto_update_app: nextVal } });
                     await onRefresh();
+                    if (nextVal && snapshot.app_update?.state !== 'ready') {
+                      setUpdatingApp(true);
+                      try {
+                        await request('app.update');
+                        await onRefresh();
+                      } finally {
+                        setUpdatingApp(false);
+                      }
+                    }
                   } catch (err) {
                     onMessage(`${t('Lỗi lưu cấu hình: ', 'Failed to save settings: ')}${err instanceof Error ? err.message : String(err)}`, 'error');
                   }

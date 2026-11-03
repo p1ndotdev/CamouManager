@@ -108,7 +108,6 @@ export default function App() {
   });
   const [busyCount, setBusyCount] = useState(0);
   const [appUpdate, setAppUpdate] = useState<AppUpdateStatus | null>(null);
-  const [updatingApp, setUpdatingApp] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<NoticeItem | null>(null);
@@ -378,58 +377,6 @@ export default function App() {
     };
   }, [snapshot, backupState, appUpdate]);
 
-  const handleAppUpdate = useCallback(async () => {
-    setUpdatingApp(true);
-    try {
-      const res = await request<AppUpdateStatus>('app.update');
-      setAppUpdate(res);
-      if (res.state === 'ready') {
-        showMessage(
-          t(
-            `Đã tải và cài đặt CamouManager ${res.latest_version}. Tắt và mở lại ứng dụng để hoàn tất cập nhật.`,
-            `Downloaded and installed CamouManager ${res.latest_version}. Close and reopen the app to finish updating.`
-          ),
-          'info'
-        );
-      } else {
-        showMessage(
-          t(
-            `CamouManager đã ở phiên bản mới nhất (v${res.current_version}).`,
-            `CamouManager is already up to date (v${res.current_version}).`
-          ),
-          'info'
-        );
-      }
-    } catch (err) {
-      showMessage(
-        `${t('Lỗi cập nhật ứng dụng: ', 'App update failed: ')}${err instanceof Error ? err.message : String(err)}`,
-        'error'
-      );
-    } finally {
-      setUpdatingApp(false);
-    }
-  }, [showMessage, t]);
-
-  const handleToggleAutoUpdate = useCallback(
-    async (checked: boolean) => {
-      try {
-        await request('settings.save', { data: { auto_update_app: checked } });
-        await refreshSnapshot();
-        if (checked && appUpdate?.state !== 'ready') {
-          void handleAppUpdate();
-        }
-      } catch (err) {
-        showMessage(
-          `${t('Lỗi lưu cấu hình tự động cập nhật: ', 'Failed to save auto-update setting: ')}${
-            err instanceof Error ? err.message : String(err)
-          }`,
-          'error'
-        );
-      }
-    },
-    [appUpdate?.state, handleAppUpdate, refreshSnapshot, showMessage, t]
-  );
-
   return (
     <div className="cm-app">
       <aside className="cm-sidebar" aria-label={t('Điều hướng chính', 'Main navigation')}>
@@ -468,40 +415,7 @@ export default function App() {
         </button>
 
         <div className="cm-sidebar-footer">
-          <div>v{appUpdate?.current_version || '1.0.6'}</div>
-          {appUpdate?.state === 'ready' ? (
-            <div style={{ color: 'var(--success)', fontWeight: 600 }}>
-              {t(`Chờ mở lại (${appUpdate.latest_version})`, `Restart (${appUpdate.latest_version})`)}
-            </div>
-          ) : null}
-          <Button
-            variant={appUpdate?.state === 'ready' ? 'secondary' : 'primary'}
-            size="sm"
-            loading={updatingApp || appUpdate?.state === 'checking' || appUpdate?.state === 'downloading'}
-            disabled={updatingApp || appUpdate?.state === 'checking' || appUpdate?.state === 'downloading'}
-            onClick={handleAppUpdate}
-            style={{ width: '100%', padding: '4px 6px', fontSize: 11 }}
-          >
-            {appUpdate?.state === 'ready'
-              ? t('Đã cài update', 'Update ready')
-              : t('Cập nhật', 'Update')}
-          </Button>
-          <label
-            style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', color: 'var(--text-primary)' }}
-            title={t(
-              'Tự động tải và cài đặt bản cập nhật ứng dụng từ GitHub, áp dụng khi tắt và mở lại app',
-              'Automatically download and install app updates from GitHub, applied on restart'
-            )}
-          >
-            <input
-              type="checkbox"
-              className="cm-checkbox"
-              checked={Boolean(snapshot?.settings?.auto_update_app)}
-              onChange={(e) => handleToggleAutoUpdate(e.target.checked)}
-            />
-            <span>{t('Auto update', 'Auto update')}</span>
-          </label>
-          <div style={{ marginTop: 2 }}>{t('Đang chạy: ', 'Running: ')}{runningCount}</div>
+          <div>{t('Đang chạy: ', 'Running: ')}{runningCount}</div>
           {busyCount > 0 ? <div>{t('Tác vụ nền: ', 'Background tasks: ')}{busyCount}</div> : null}
         </div>
       </aside>

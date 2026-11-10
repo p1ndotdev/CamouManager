@@ -90,6 +90,35 @@ export default function Profiles({
   const [backupPassword, setBackupPassword] = useState('');
   const [backupUnencryptedConfirm, setBackupUnencryptedConfirm] = useState(false);
   const [backupCreating, setBackupCreating] = useState(false);
+  const [backupProgress, setBackupProgress] = useState<{
+    current: number;
+    total: number;
+    percent?: number;
+    profile_name: string;
+    phase: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!backupCreating) {
+      setBackupProgress(null);
+      return;
+    }
+    let active = true;
+    const timer = window.setInterval(async () => {
+      try {
+        const st = await request<{ backup?: { progress?: { active: boolean; current: number; total: number; profile_name: string; phase: string } } }>('app.status');
+        if (active && st?.backup?.progress?.active) {
+          setBackupProgress(st.backup.progress);
+        }
+      } catch {
+        // ignore status poll errors
+      }
+    }, 250);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [backupCreating]);
 
   const [restoreOpen, setRestoreOpen] = useState(false);
   const [restorePath, setRestorePath] = useState('');
@@ -1747,6 +1776,26 @@ export default function Profiles({
               placeholder={t('Nhập mật khẩu để bảo vệ cookie và phiên duyệt...', 'Enter password to protect cookies and sessions...')}
             />
           </Field>
+
+          {backupCreating ? (
+            <div className="cm-card" style={{ marginBottom: 12, padding: '10px 12px' }}>
+              <div style={{ fontSize: 12, marginBottom: 6, fontWeight: 600 }}>
+                {backupProgress?.phase === 'encrypting'
+                  ? t('Đang mã hóa bản sao lưu (AES-GCM)...', 'Encrypting backup archive (AES-GCM)...')
+                  : backupProgress && backupProgress.total > 0
+                    ? t(
+                        `Đang đóng gói profile ${backupProgress.current}/${backupProgress.total}${backupProgress.profile_name ? `: ${backupProgress.profile_name}` : ''} (${backupProgress.percent ?? Math.round((backupProgress.current / backupProgress.total) * 100)}%)`,
+                        `Packing profile ${backupProgress.current}/${backupProgress.total}${backupProgress.profile_name ? `: ${backupProgress.profile_name}` : ''} (${backupProgress.percent ?? Math.round((backupProgress.current / backupProgress.total) * 100)}%)`
+                      )
+                    : t('Đang chuẩn bị dữ liệu sao lưu...', 'Preparing backup data...')}
+              </div>
+              <progress
+                max={backupProgress && backupProgress.total > 0 ? 100 : undefined}
+                value={backupProgress && backupProgress.total > 0 ? (backupProgress.percent ?? Math.round((backupProgress.current / backupProgress.total) * 100)) : undefined}
+                style={{ width: '100%', height: 10, accentColor: 'var(--accent)' }}
+              />
+            </div>
+          ) : null}
 
           <div className="cm-banner cm-banner-info">
             <strong>{t('Lưu ý bảo mật:', 'Security note:')}</strong>{' '}

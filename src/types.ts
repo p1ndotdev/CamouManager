@@ -100,11 +100,20 @@ export interface Settings {
   last_update_check_at?: string;
   [key: string]: unknown;
 }
+export interface BackupProgress {
+  active: boolean;
+  current: number;
+  total: number;
+  percent?: number;
+  profile_name: string;
+  phase: string;
+}
 
 export interface BackupState {
   state: 'disabled' | 'password_required' | 'waiting' | 'running' | 'error';
   message: string;
   last_at: string;
+  progress?: BackupProgress;
 }
 
 export interface Backup {

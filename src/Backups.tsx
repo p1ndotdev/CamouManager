@@ -521,6 +521,35 @@ function BackupCreateModal({ profiles, onClose, onCreated, onMessage }: BackupCr
   const [password, setPassword] = useState('');
   const [creating, setCreating] = useState(false);
   const [confirmUnencrypted, setConfirmUnencrypted] = useState(false);
+  const [progress, setProgress] = useState<{
+    current: number;
+    total: number;
+    percent?: number;
+    profile_name: string;
+    phase: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!creating) {
+      setProgress(null);
+      return;
+    }
+    let active = true;
+    const timer = window.setInterval(async () => {
+      try {
+        const st = await request<{ backup?: { progress?: { active: boolean; current: number; total: number; profile_name: string; phase: string } } }>('app.status');
+        if (active && st?.backup?.progress?.active) {
+          setProgress(st.backup.progress);
+        }
+      } catch {
+        // ignore status poll errors
+      }
+    }, 250);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [creating]);
 
   const toggleProfile = (id: string) => {
     setSelectedIds((prev) => {
@@ -718,6 +747,25 @@ function BackupCreateModal({ profiles, onClose, onCreated, onMessage }: BackupCr
             />
           </Field>
 
+          {creating ? (
+            <div className="cm-card" style={{ marginTop: 12, padding: '10px 12px' }}>
+              <div style={{ fontSize: 12, marginBottom: 6, fontWeight: 600 }}>
+                {progress?.phase === 'encrypting'
+                  ? t('Đang mã hóa bản sao lưu (AES-GCM)...', 'Encrypting backup archive (AES-GCM)...')
+                  : progress && progress.total > 0
+                    ? t(
+                        `Đang đóng gói profile ${progress.current}/${progress.total}${progress.profile_name ? `: ${progress.profile_name}` : ''} (${progress.percent ?? Math.round((progress.current / progress.total) * 100)}%)`,
+                        `Packing profile ${progress.current}/${progress.total}${progress.profile_name ? `: ${progress.profile_name}` : ''} (${progress.percent ?? Math.round((progress.current / progress.total) * 100)}%)`
+                      )
+                    : t('Đang chuẩn bị dữ liệu sao lưu...', 'Preparing backup data...')}
+              </div>
+              <progress
+                max={progress && progress.total > 0 ? 100 : undefined}
+                value={progress && progress.total > 0 ? (progress.percent ?? Math.round((progress.current / progress.total) * 100)) : undefined}
+                style={{ width: '100%', height: 10, accentColor: 'var(--accent)' }}
+              />
+            </div>
+          ) : null}
           <div className="cm-banner cm-banner-warning" style={{ marginTop: '12px' }}>
             {t(
               'Lưu ý bảo mật: Bản sao lưu chứa dữ liệu phiên duyệt web, cookie và thông tin proxy đã gán. Nếu đặt mật khẩu, file sẽ được mã hóa an toàn bằng AES-GCM. Nếu để trống mật khẩu, file sẽ được lưu ở dạng zip thông thường không mã hóa.',

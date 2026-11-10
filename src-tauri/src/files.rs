@@ -55,7 +55,7 @@ fn archive_path(name: &str) -> Result<PathBuf> {
 pub fn extract_zip<R: Read + Seek>(archive: R, target: &Path, max_bytes: u64, cancel: Option<&dyn Fn() -> bool>) -> Result<bool> {
     reject_link(target)?;
     let mut zip = zip::ZipArchive::new(archive)?;
-    if zip.len() > 100_000 { bail!("ZIP vượt giới hạn số file an toàn"); }
+    if zip.len() > 500_000 { bail!("ZIP vượt giới hạn số file an toàn"); }
     let mut declared = 0u64;
     let mut names = HashSet::with_capacity(zip.len());
     let mut paths = Vec::with_capacity(zip.len());

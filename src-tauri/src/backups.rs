@@ -34,10 +34,10 @@ const SCRYPT_P: u32 = 1;
 const SCRYPT_KEY_LEN: usize = 32;
 
 const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB
-const MAX_MANIFEST_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
+const MAX_MANIFEST_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 const MAX_SINGLE_FILE: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
-const MAX_TOTAL_UNCOMPRESSED: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
-const MAX_ENTRIES: usize = 100_000;
+const MAX_TOTAL_UNCOMPRESSED: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
+const MAX_ENTRIES: usize = 500_000;
 const MAX_METADATA_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB consistent IPC bound
 
 #[derive(Clone, Copy, Debug)]
@@ -105,7 +105,23 @@ fn cleanup_legacy_residues_in_dir(dir: &Path) -> Result<()> {
     }
     Ok(())
 }
-const LOCK_FILES: &[&str] = &["parent.lock", "lock", ".parentlock"];
+const LOCK_FILES: &[&str] = &["parent.lock", "lock", ".parentlock", ".startup-incomplete"];
+const SKIP_BROWSER_DIRS: &[&str] = &[
+    "cache2",
+    "startupCache",
+    "shader-cache",
+    "jumpListCache",
+    "gmp-widevinecdm",
+    "gmp-gmpopenh264",
+    "gmp-clearkey",
+    "datareporting",
+    "crashreports",
+    "minidumps",
+    "saved-telemetry-pings",
+    "thumbnails",
+    "safebrowsing",
+    "bookmarkbackups",
+];
 
 fn derive_key(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
     let params = scrypt::Params::new(SCRYPT_LOG_N, SCRYPT_R, SCRYPT_P, SCRYPT_KEY_LEN)
@@ -424,6 +440,7 @@ pub struct Backups {
     session_password: Mutex<String>,
     is_running_scheduled: Mutex<bool>,
     last_error: Mutex<String>,
+    progress: Mutex<Value>,
 }
 
 impl Backups {
@@ -434,6 +451,14 @@ impl Backups {
             session_password: Mutex::new(String::new()),
             is_running_scheduled: Mutex::new(false),
             last_error: Mutex::new(String::new()),
+            progress: Mutex::new(json!({
+                "active": false,
+                "current": 0,
+                "total": 0,
+                "percent": 0,
+                "profile_name": "",
+                "phase": "",
+            })),
         }
     }
 
@@ -470,6 +495,7 @@ impl Backups {
             "state": state,
             "message": last_err,
             "last_at": last_at,
+            "progress": self.progress.lock().clone(),
         }))
     }
 
@@ -679,6 +705,20 @@ impl Backups {
             reject_link(&path)?;
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
+                if skip_lock_files {
+                    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                    if dir == root && SKIP_BROWSER_DIRS.contains(&name) {
+                        continue;
+                    }
+                    if name == "cache" || name == "temporary" {
+                        if let Ok(rel) = path.strip_prefix(root) {
+                            let rel_s = rel.to_string_lossy().replace('\\', "/");
+                            if rel_s.starts_with("storage/default/") || rel_s == "storage/temporary" {
+                                continue;
+                            }
+                        }
+                    }
+                }
                 Self::collect_files_recursive(root, &path, results, skip_lock_files)?;
             } else if file_type.is_file() {
                 if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
@@ -704,6 +744,7 @@ impl Backups {
         total_uncompressed: &mut u64,
         entry_count: &mut usize,
         limits: &ArchiveLimits,
+        on_file: Option<&dyn Fn(usize, usize)>,
     ) -> Result<()> {
         reject_link(dir)?;
         let mut entries = Vec::new();
@@ -711,7 +752,11 @@ impl Backups {
         entries.sort_by(|a, b| a.1.cmp(&b.1));
 
         let mut buffer = vec![0u8; CHUNK_SIZE];
-        for (abs_path, rel_posix) in entries {
+        let total_files = entries.len();
+        for (f_idx, (abs_path, rel_posix)) in entries.into_iter().enumerate() {
+            if let Some(cb) = on_file {
+                cb(f_idx + 1, total_files);
+            }
             reject_link(&abs_path)?;
             *entry_count += 1;
             if *entry_count > limits.max_entries {
@@ -775,8 +820,18 @@ impl Backups {
         let mut total_uncompressed: u64 = 0;
         let mut entry_count: usize = 0;
 
-        for prof in profiles_to_backup {
+        for (idx, prof) in profiles_to_backup.iter().enumerate() {
             let pid = string(prof, "id");
+            let total_profs = profiles_to_backup.len().max(1);
+            let pname = string(prof, "name").to_string();
+            *self.progress.lock() = json!({
+                "active": true,
+                "current": idx + 1,
+                "total": profiles_to_backup.len(),
+                "percent": (idx * 100) / total_profs,
+                "profile_name": pname,
+                "phase": "packing",
+            });
             let clean_prof = Self::scrub_profile_paths(prof)?;
             let prof_json_bytes = serde_json::to_vec_pretty(&clean_prof)?;
             if prof_json_bytes.len() as u64 > limits.max_metadata_size {
@@ -834,6 +889,11 @@ impl Backups {
                         &mut total_uncompressed,
                         &mut entry_count,
                         limits,
+                        Some(&|done, tot| {
+                            let frac = if tot > 0 { (done * 100) / tot } else { 100 };
+                            let pct = ((idx * 100) + frac) / total_profs;
+                            self.progress.lock()["percent"] = json!(pct.min(99));
+                        }),
                     )?;
                 }
                 let addons_dir = prof_dir.join("addons");
@@ -848,6 +908,7 @@ impl Backups {
                         &mut total_uncompressed,
                         &mut entry_count,
                         limits,
+                        None,
                     )?;
                 }
             }
@@ -913,7 +974,7 @@ impl Backups {
             "files": files_manifest,
         });
 
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+        let manifest_bytes = serde_json::to_vec(&manifest)?;
         if manifest_bytes.len() as u64 > limits.max_manifest_size {
             bail!("Manifest file exceeds size limit");
         }
@@ -1031,6 +1092,13 @@ impl Backups {
             &new_id()[..6]
         ));
 
+        *self.progress.lock() = json!({
+            "active": true,
+            "current": 0,
+            "total": profiles_to_backup.len(),
+            "profile_name": "",
+            "phase": "packing",
+        });
         let build_and_finalize = || -> Result<()> {
             if !password.is_empty() {
                 let mut temp_file = tempfile::tempfile_in(&self.store.root)?;
@@ -1048,6 +1116,13 @@ impl Backups {
                     zip.finish()?;
                 }
                 temp_file.seek(SeekFrom::Start(0))?;
+                *self.progress.lock() = json!({
+                    "active": true,
+                    "current": profiles_to_backup.len(),
+                    "total": profiles_to_backup.len(),
+                    "profile_name": "",
+                    "phase": "encrypting",
+                });
                 let mut dest_file = File::create(&temp_dest_path)?;
                 stream_encrypt(&mut temp_file, &mut dest_file, password)?;
                 dest_file.flush()?;
@@ -1097,6 +1172,13 @@ impl Backups {
         };
 
         let res = build_and_finalize();
+        *self.progress.lock() = json!({
+            "active": false,
+            "current": 0,
+            "total": 0,
+            "profile_name": "",
+            "phase": "",
+        });
         if res.is_err() {
             let _ = fs::remove_file(&temp_dest_path);
         }
@@ -2389,9 +2471,9 @@ mod tests {
             let mut zip = ZipWriter::new(file);
             let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-            let mut large_manifest = Vec::with_capacity(10 * 1024 * 1024 + 2048);
+            let mut large_manifest = Vec::with_capacity(MAX_MANIFEST_SIZE as usize + 2048);
             large_manifest.extend_from_slice(b"{\"schema_version\":1,\"app\":\"CamouManager\",\"padding\":\"");
-            large_manifest.resize(10 * 1024 * 1024 + 1024, b'A');
+            large_manifest.resize(MAX_MANIFEST_SIZE as usize + 1024, b'A');
             large_manifest.extend_from_slice(b"\"}");
 
             zip.start_file("manifest.json", opts).unwrap();
@@ -2844,5 +2926,42 @@ mod tests {
             assert!(source.backups.create(&[id], Some(&rejected), "").is_err());
             assert!(!rejected.exists());
         }
+    }
+
+    #[test]
+    fn backup_skips_browser_caches_and_preserves_session_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let source = crate::backend::Backend::open(root.path().join("source")).unwrap();
+        let profile = source.profiles.create(json!({
+            "name": "LeanBackup",
+            "os": "windows",
+            "proxy_id": "",
+            "location": {"locked": true},
+            "fingerprint_meta": {"use_preset": false}
+        })).unwrap();
+        let id = string(&profile, "id").to_owned();
+        let browser_dir = source.store.profile_dir(&id).unwrap().join("browser");
+        fs::create_dir_all(browser_dir.join("cache2/entries")).unwrap();
+        fs::write(browser_dir.join("cache2/entries/blob"), b"cached-http").unwrap();
+        fs::create_dir_all(browser_dir.join("startupCache")).unwrap();
+        fs::write(browser_dir.join("startupCache/startupCache.8.little"), b"bytecode").unwrap();
+        fs::create_dir_all(browser_dir.join("gmp-widevinecdm/4.10")).unwrap();
+        fs::write(browser_dir.join("gmp-widevinecdm/4.10/widevinecdm.dll"), b"drm").unwrap();
+        fs::create_dir_all(browser_dir.join("storage/default/https+++example.com/cache")).unwrap();
+        fs::write(browser_dir.join("storage/default/https+++example.com/cache/morgue"), b"sw-cache").unwrap();
+        fs::create_dir_all(browser_dir.join("storage/default/https+++example.com/idb")).unwrap();
+        fs::write(browser_dir.join("storage/default/https+++example.com/idb/data.sqlite"), b"idb-keep").unwrap();
+        fs::write(browser_dir.join("cookies.sqlite"), b"cookies-keep").unwrap();
+
+        let archive = source.backups.create(&[id.clone()], Some(&root.path().join("lean.zip")), "").unwrap();
+        let target = crate::backend::Backend::open(root.path().join("target")).unwrap();
+        let restored = target.backups.restore(&archive, "").unwrap();
+        let restored_bdir = target.store.profile_dir(string(&restored[0], "id")).unwrap().join("browser");
+        assert_eq!(fs::read(restored_bdir.join("cookies.sqlite")).unwrap(), b"cookies-keep");
+        assert_eq!(fs::read(restored_bdir.join("storage/default/https+++example.com/idb/data.sqlite")).unwrap(), b"idb-keep");
+        assert!(!restored_bdir.join("cache2").exists());
+        assert!(!restored_bdir.join("startupCache").exists());
+        assert!(!restored_bdir.join("gmp-widevinecdm").exists());
+        assert!(!restored_bdir.join("storage/default/https+++example.com/cache").exists());
     }
 }

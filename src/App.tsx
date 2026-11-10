@@ -179,7 +179,12 @@ export default function App() {
           if (
             prev.state === evt.backup.state &&
             prev.message === evt.backup.message &&
-            prev.last_at === evt.backup.last_at
+            prev.last_at === evt.backup.last_at &&
+            prev.progress?.active === evt.backup.progress?.active &&
+            prev.progress?.current === evt.backup.progress?.current &&
+            prev.progress?.total === evt.backup.progress?.total &&
+            prev.progress?.profile_name === evt.backup.progress?.profile_name &&
+            prev.progress?.phase === evt.backup.progress?.phase
           ) {
             return prev;
           }

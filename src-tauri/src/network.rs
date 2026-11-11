@@ -3,6 +3,8 @@ pub use crate::proxy_bridge::{BridgeConfig, ProxyBridge, UpstreamProtocol};
 use crate::store::{redact, string, utcnow, Store};
 use anyhow::{anyhow, bail, Result};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::{fs, io::Read, path::Path};
 use std::{
     net::IpAddr,
     sync::Arc,
@@ -382,31 +384,149 @@ impl Network {
         Ok(saved)
     }
 
-    pub fn import_text(&self, text: &str) -> Result<Vec<Value>> {
-        let lines: Vec<&str> = text.lines().collect();
-        let mut parsed_items = Vec::new();
+    fn deterministic_proxy_id(seed: &str) -> String {
+        hex::encode(Sha256::digest(seed.as_bytes()))[..32].to_string()
+    }
 
-        for (idx, raw_line) in lines.iter().enumerate() {
-            let line_num = idx + 1;
-            let stripped = raw_line.trim();
-            if stripped.is_empty() || stripped.starts_with('#') {
-                continue;
+    pub fn import_text(&self, text: &str) -> Result<Vec<Value>> {
+        self.import_content(text, false, None).map(|(rows, _)| rows)
+    }
+
+    /// Returns imported proxies plus per-entry warnings (skipped running/missing profiles).
+    pub fn import_file(&self, path: &Path, profiles: &crate::profiles::Profiles) -> Result<(Vec<Value>, Vec<String>)> {
+        crate::files::reject_link(path)?;
+        if !fs::metadata(path)?.is_file() {
+            bail!("Đường dẫn proxy không phải file");
+        }
+        let file = fs::File::open(path)?;
+        let mut raw = String::new();
+        file.take(4 * 1024 * 1024 + 1).read_to_string(&mut raw)?;
+        if raw.len() > 4 * 1024 * 1024 {
+            bail!("File proxy vượt quá 4 MiB");
+        }
+        self.import_content(&raw, true, Some(profiles))
+    }
+
+    pub fn import_content(
+        &self,
+        text: &str,
+        dedupe_keyless: bool,
+        profiles: Option<&crate::profiles::Profiles>,
+    ) -> Result<(Vec<Value>, Vec<String>)> {
+        let trimmed = text.trim();
+        let mut parsed_items: Vec<(Value, Vec<String>)> = Vec::new();
+
+        if trimmed.starts_with('[') {
+            let arr: Vec<Value> = serde_json::from_str(trimmed)?;
+            for (idx, mut item) in arr.into_iter().enumerate() {
+                let obj = item
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("Mục #{} trong file proxy phải là object", idx + 1))?;
+                let mut assign_profiles = Vec::new();
+                if let Some(pid) = obj.remove("profile_id").and_then(|v| v.as_str().map(str::to_owned)) {
+                    if !pid.trim().is_empty() {
+                        assign_profiles.push(pid.trim().to_owned());
+                    }
+                }
+                if let Some(pids) = obj.remove("profile_ids").and_then(|v| v.as_array().cloned()) {
+                    for p in pids {
+                        if let Some(s) = p.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                            assign_profiles.push(s.to_owned());
+                        }
+                    }
+                }
+                let ext_key = obj
+                    .remove("external_key")
+                    .and_then(|v| v.as_str().map(|s| s.trim().to_owned()))
+                    .unwrap_or_default();
+                let raw_id = obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .to_owned();
+
+                if raw_id.len() == 32 && raw_id.bytes().all(|c| c.is_ascii_hexdigit()) {
+                    obj.insert("id".into(), json!(raw_id.to_ascii_lowercase()));
+                } else if !raw_id.is_empty() {
+                    obj.insert("id".into(), json!(Self::deterministic_proxy_id(&format!("id:{raw_id}"))));
+                } else if !ext_key.is_empty() {
+                    obj.insert("id".into(), json!(Self::deterministic_proxy_id(&format!("ext:{ext_key}"))));
+                }
+                let resolved = self.resolve_proxy(&Value::Object(obj.clone()))?;
+                if obj.get("id").and_then(Value::as_str).unwrap_or("").is_empty() && dedupe_keyless {
+                    let id_val = Self::deterministic_proxy_id(&format!(
+                        "srv:{}:{}",
+                        string(&resolved, "server"),
+                        string(&resolved, "username")
+                    ));
+                    obj.insert("id".into(), json!(id_val));
+                }
+                parsed_items.push((item, assign_profiles));
             }
-            match parse_proxy_line(stripped) {
-                Ok(item) => parsed_items.push(item),
-                Err(e) => bail!("Line {} invalid proxy: {}", line_num, e),
+        } else {
+            for (idx, raw_line) in text.lines().enumerate() {
+                let line_num = idx + 1;
+                let stripped = raw_line.trim();
+                if stripped.is_empty() || stripped.starts_with('#') {
+                    continue;
+                }
+                match parse_proxy_line(stripped) {
+                    Ok(mut item) => {
+                        if dedupe_keyless {
+                            let id_val = Self::deterministic_proxy_id(&format!(
+                                "srv:{}:{}",
+                                string(&item, "server"),
+                                string(&item, "username")
+                            ));
+                            item["id"] = json!(id_val);
+                        }
+                        parsed_items.push((item, Vec::new()));
+                    }
+                    Err(e) => bail!("Line {} invalid proxy: {}", line_num, e),
+                }
             }
         }
 
         let _guard = self.store.operation.lock();
-        let mut imported = Vec::with_capacity(parsed_items.len());
-        for item in parsed_items {
-            let saved = self.save(item)?;
-            imported.push(saved);
+        let all_profiles = self.store.list("profiles")?;
+        let mut warnings = Vec::new();
+        let mut records = Vec::with_capacity(parsed_items.len());
+        let mut assignments = Vec::with_capacity(parsed_items.len());
+        for (item, mut assign_profiles) in parsed_items {
+            let resolved = self.resolve_proxy(&item)?;
+            if let Some(profs) = profiles {
+                // Same rule as proxy.save: never change a proxy a running browser is using.
+                let in_use = all_profiles.iter().any(|p| {
+                    string(p, "proxy_id") == string(&resolved, "id") && profs.closed(string(p, "id")).is_err()
+                });
+                if in_use {
+                    warnings.push(format!("Bỏ qua proxy '{}' vì đang được hồ sơ đang chạy sử dụng", string(&resolved, "name")));
+                    continue;
+                }
+                assign_profiles.retain(|pid| match profs.get(pid) {
+                    Err(_) => { warnings.push(format!("Bỏ qua gán proxy: không tìm thấy hồ sơ '{pid}'")); false }
+                    Ok(_) if profs.closed(pid).is_err() => { warnings.push(format!("Bỏ qua gán proxy cho hồ sơ đang chạy '{pid}'")); false }
+                    Ok(_) => true,
+                });
+            }
+            records.push(resolved);
+            assignments.push(assign_profiles);
+        }
+        let imported = self.store.put_many("proxies", records)?;
+        if let Some(profs) = profiles {
+            for (saved, assign_profiles) in imported.iter().zip(assignments) {
+                if !assign_profiles.is_empty() {
+                    profs.set_many(&assign_profiles, "proxy_id", json!(string(saved, "id")))?;
+                }
+            }
         }
 
-        self.store.log("INFO", &format!("Imported {} proxies from text", imported.len()), "")?;
-        Ok(imported)
+        self.store.log("INFO", &format!("Imported {} proxies", imported.len()), "")?;
+        for warning in &warnings {
+            self.store.log("WARNING", warning, "")?;
+        }
+        Ok((imported, warnings))
     }
 
     pub fn delete(&self, id: &str, profiles: &crate::profiles::Profiles) -> Result<()> {
@@ -1288,5 +1408,66 @@ mod tests {
             assert!(!fallback_seen.load(Ordering::Acquire), "Geolocation downgraded to plaintext fallback");
             assert!(result.is_err(), "Invalid geolocation accepted: {result:?}");
         }
+    }
+
+    #[test]
+    fn import_file_json_and_text_dedupes_by_id_without_matching_name() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = crate::backend::Backend::open(root.path().to_owned()).unwrap();
+        let p1 = backend.profiles.create(json!({
+            "name": "WarpProfile1",
+            "os": "windows",
+            "proxy_id": "",
+            "location": {"locked": true},
+            "fingerprint_meta": {"use_preset": false}
+        })).unwrap();
+        let pid1 = string(&p1, "id").to_owned();
+
+        // Manual proxy with same display name "WARP #01" must NEVER be overwritten
+        let manual = backend.network.save(json!({
+            "name": "WARP #01",
+            "server": "socks5://127.0.0.1:1080"
+        })).unwrap();
+
+        let cfg_path = root.path().join("proxy.config");
+        fs::write(&cfg_path, serde_json::to_string_pretty(&json!([
+            {
+                "id": "warp_slot_01",
+                "name": "WARP #01",
+                "server": "socks5://127.0.0.1:40001",
+                "profile_id": pid1
+            }
+        ])).unwrap()).unwrap();
+
+        let (imported1, _) = backend.network.import_file(&cfg_path, &backend.profiles).unwrap();
+        assert_eq!(imported1.len(), 1);
+        let warp_id = string(&imported1[0], "id").to_owned();
+        assert_eq!(warp_id.len(), 32);
+        assert_ne!(warp_id, string(&manual, "id"));
+        assert_eq!(backend.store.get("proxies", string(&manual, "id")).unwrap().unwrap()["server"], "socks5://127.0.0.1:1080");
+        assert_eq!(backend.profiles.get(&pid1).unwrap()["proxy_id"], warp_id);
+
+        // Updating server port for same id updates in place without duplicating
+        fs::write(&cfg_path, serde_json::to_string_pretty(&json!([
+            {
+                "id": "warp_slot_01",
+                "name": "WARP #01",
+                "server": "socks5://127.0.0.1:40099"
+            }
+        ])).unwrap()).unwrap();
+        let (imported2, _) = backend.network.import_file(&cfg_path, &backend.profiles).unwrap();
+        assert_eq!(string(&imported2[0], "id"), warp_id);
+        assert_eq!(imported2[0]["server"], "socks5://127.0.0.1:40099");
+        assert_eq!(backend.store.list("proxies").unwrap().len(), 2);
+
+        // A stale profile id must not block the rest of the file.
+        fs::write(&cfg_path, serde_json::to_string_pretty(&json!([
+            {"id": "warp_slot_02", "server": "socks5://127.0.0.1:40002", "profile_id": "00000000000000000000000000000000"},
+            {"id": "warp_slot_03", "server": "socks5://127.0.0.1:40003"}
+        ])).unwrap()).unwrap();
+        let (imported3, warnings3) = backend.network.import_file(&cfg_path, &backend.profiles).unwrap();
+        assert_eq!(imported3.len(), 2);
+        assert_eq!(warnings3.len(), 1);
+        assert_eq!(backend.store.list("proxies").unwrap().len(), 4);
     }
 }

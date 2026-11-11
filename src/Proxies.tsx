@@ -1,6 +1,6 @@
 import React, { useState, useMemo, useId, useCallback } from 'react';
 import type { PageProps, Proxy, ProxyCheck } from './types';
-import { request } from './api';
+import { openPath, request } from './api';
 import {
   Button,
   Modal,
@@ -844,6 +844,40 @@ function ProxyImportModal({ onClose, onImported, onMessage }: ProxyImportModalPr
     }
   };
 
+  const handleImportFile = async () => {
+    try {
+      const chosen = await openPath({
+        filters: [
+          {
+            name: t('File cấu hình Proxy (*.config, *.json, *.txt)', 'Proxy Config / List (*.config, *.json, *.txt)'),
+            extensions: ['config', 'json', 'txt'],
+          },
+        ],
+      });
+      if (!chosen) return;
+      setImporting(true);
+      const res = await request<Proxy[]>('proxy.import_file', { path: chosen });
+      onMessage(
+        t(
+          `Đã nhập/cập nhật thành công ${res.length} proxy từ file.`,
+          `Successfully imported/updated ${res.length} proxies from file.`
+        ),
+        'info'
+      );
+      onImported();
+    } catch (err: unknown) {
+      onMessage(
+        t(
+          `Lỗi nhập file proxy: ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to import proxy file: ${err instanceof Error ? err.message : String(err)}`
+        ),
+        'error'
+      );
+    } finally {
+      setImporting(false);
+    }
+  };
+
   return (
     <Modal
       busy={importing}
@@ -851,13 +885,18 @@ function ProxyImportModal({ onClose, onImported, onMessage }: ProxyImportModalPr
       onClose={onClose}
       width={600}
       footer={
-        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', width: '100%' }}>
-          <Button variant="secondary" disabled={importing} onClick={onClose}>
-            {t('Hủy bỏ', 'Cancel')}
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: '8px', width: '100%', flexWrap: 'wrap' }}>
+          <Button variant="secondary" loading={importing} disabled={importing} onClick={handleImportFile}>
+            {t('Chọn file (.txt / .json / .config)...', 'Import from File (.txt / .json / .config)...')}
           </Button>
-          <Button variant="primary" loading={importing} disabled={importing} onClick={handleImport}>
-            {t('Phân tích & Thêm vào kho', 'Parse & Add to Pool')}
-          </Button>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <Button variant="secondary" disabled={importing} onClick={onClose}>
+              {t('Hủy bỏ', 'Cancel')}
+            </Button>
+            <Button variant="primary" loading={importing} disabled={importing} onClick={handleImport}>
+              {t('Phân tích & Thêm vào kho', 'Parse & Add to Pool')}
+            </Button>
+          </div>
         </div>
       }
     >

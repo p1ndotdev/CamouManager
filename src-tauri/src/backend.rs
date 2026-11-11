@@ -153,7 +153,16 @@ impl Backend {
                 self.check_proxy_closed(string(&data,"id"))?;
                 self.network.save(data).map(|p| summary(&p))
             },
-            "proxy.import" => self.network.import_text(require_str(&params,"text")?).map(|p| json!(p.iter().map(summary).collect::<Vec<_>>())),
+            "proxy.import" => self.network.import_content(require_str(&params,"text")?,false,Some(&self.profiles)).map(|(p, _)| json!(p.iter().map(summary).collect::<Vec<_>>())),
+            "proxy.import_file" => {
+                let p = string(&params,"path").trim().to_owned();
+                let target = if p.is_empty() { self.store.root.join("proxy.config") } else { PathBuf::from(p) };
+                let (rows, warnings) = self.network.import_file(&target,&self.profiles)?;
+                if let (Some(app), false) = (app, warnings.is_empty()) {
+                    let _ = app.emit("app:notice", json!({"level": "warning", "message": warnings.join("; ")}));
+                }
+                Ok(json!(rows.iter().map(summary).collect::<Vec<_>>()))
+            },
             "proxy.delete" => {
                 let _lock = self.store.operation.lock(); self.check_proxy_closed(id()?)?;
                 self.network.delete(id()?, &self.profiles)?; Ok(Value::Null)
@@ -195,7 +204,7 @@ impl Backend {
                 let resources: &[&str] = match method {
                     "backup.restore" => &["profiles","proxies","backups"],
                     "proxy.delete" => &["proxies","profiles","settings"],
-                    "proxy.save"|"proxy.import"|"proxy.check"|"proxy.check_all" => &["proxies"],
+                    "proxy.save"|"proxy.import"|"proxy.import_file"|"proxy.check"|"proxy.check_all" => &["proxies","profiles"],
                     "settings.save"|"app.update" => &["settings"],
                     "versions.install"|"versions.delete"|"versions.check_updates" => &["versions","profiles"],
                     "fingerprint_data.update" => &["fingerprint_data"],
@@ -215,10 +224,49 @@ impl Backend {
             let mut last_tick = Instant::now() - Duration::from_secs(60);
             let scheduled = Arc::new(AtomicBool::new(false));
             let app_checked = Arc::new(AtomicBool::new(false));
+            let mut last_proxy_cfg: Option<(std::time::SystemTime, u64)> = None;
             loop {
                 std::thread::sleep(Duration::from_secs(2));
                 let Some(backend) = weak.upgrade() else { break; };
                 if backend.stopped.load(Ordering::Acquire) { break; }
+                let cfg_path = backend.store.root.join("proxy.config");
+                if let Ok(meta) = std::fs::metadata(&cfg_path) {
+                    if meta.is_file() && meta.len() > 0 {
+                        if let Ok(mtime) = meta.modified() {
+                            let stamp = (mtime, meta.len());
+                            // try_lock: launch/backup hold `operation` for a long time; never stall the status loop behind them.
+                            if last_proxy_cfg != Some(stamp) {
+                                if let (Some(_held), Ok(_op)) = (backend.store.operation.try_lock(), backend.begin(true)) {
+                                    use sha2::{Digest, Sha256};
+                                    // Persisted hash: restarting the app must not re-apply an unchanged file over manual edits.
+                                    let hash = std::fs::read(&cfg_path).ok().filter(|raw| raw.len() <= 4 * 1024 * 1024).map(|raw| hex::encode(Sha256::digest(&raw)));
+                                    let seen = backend.store.settings().map(|s| string(&s, "proxy_config_sha256").to_owned()).unwrap_or_default();
+                                    if hash.as_deref().is_some_and(|h| h == seen) {
+                                        last_proxy_cfg = Some(stamp);
+                                    } else {
+                                        // Every outcome marks this version handled: rewriting the file is the retry path, never a 2s loop.
+                                        last_proxy_cfg = Some(stamp);
+                                        match backend.network.import_file(&cfg_path, &backend.profiles) {
+                                            Ok((_, warnings)) => {
+                                                if let Some(h) = hash { let _ = backend.store.save_settings(json!({"proxy_config_sha256": h})); }
+                                                let _ = app.emit("app:changed", json!({"resource": "proxies"}));
+                                                let _ = app.emit("app:changed", json!({"resource": "profiles"}));
+                                                if !warnings.is_empty() {
+                                                    let _ = app.emit("app:notice", json!({"level": "warning", "message": format!("proxy.config: {}", warnings.join("; "))}));
+                                                }
+                                            }
+                                            Err(err) => {
+                                                let msg = backend.store.redact_text(&format!("Không nhập được proxy.config: {err:#}"));
+                                                let _ = backend.store.log("WARNING", &msg, "");
+                                                let _ = app.emit("app:notice", json!({"level": "warning", "message": msg}));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 match backend.status() {
                     Ok(status) => { let _ = app.emit("app:status",status); },
                     Err(error) => { let _ = backend.store.log("ERROR",&error.to_string(),""); }

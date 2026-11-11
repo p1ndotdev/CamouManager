@@ -2189,7 +2189,8 @@ impl Runtime {
 
                     let endpoint = debug_endpoint.lock().take();
                     if let Some(endpoint) = endpoint {
-                        let mut driver = BrowserSession::connect(&endpoint, &owned)?;
+                        let mut driver = BrowserSession::connect(&endpoint, &owned)
+                            .context("Không mở được phiên điều khiển nội bộ của trình duyệt")?;
                         // Await monitor installation instead of Camoufox's fire-and-forget addon bootstrap.
                         let monitor_path = self.sessions.lock().get(id)
                             .and_then(|session| session.ip_sync.as_ref())

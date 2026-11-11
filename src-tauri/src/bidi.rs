@@ -24,15 +24,19 @@ impl BrowserSession {
     pub(crate) fn connect(endpoint: &url::Url, owned_pids: &[u32]) -> Result<Self> {
         let address = SocketAddr::from(([127,0,0,1],endpoint.port().context("Thiếu cổng phiên native")?));
         let stream = TcpStream::connect_timeout(&address,Duration::from_secs(2))?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        // Startup handshake and session.new can take several seconds on a cold profile; normal calls use 2s afterwards.
+        stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(15)))?;
         let mut config = WebSocketConfig::default();
         config.max_message_size = Some(64 * 1024);
         config.max_frame_size = Some(64 * 1024);
         let (socket, _) = client_with_config(endpoint.join("session")?.as_str(),stream,Some(config))
             .map_err(|error| anyhow!("Không kết nối được phiên trình duyệt native: {error}"))?;
         let mut session = Self { socket, next_id:0 };
-        let result = session.call("session.new",json!({"capabilities":{}}))?;
+        let result = session.call("session.new",json!({"capabilities":{}}));
+        session.socket.get_ref().set_read_timeout(Some(Duration::from_secs(2)))?;
+        session.socket.get_ref().set_write_timeout(Some(Duration::from_secs(2)))?;
+        let result = result?;
         let pid = result.pointer("/capabilities/moz:processID").and_then(Value::as_u64)
             .and_then(|pid| u32::try_from(pid).ok()).context("Trình duyệt không trả PID phiên native")?;
         if !owned_pids.contains(&pid) {
@@ -53,7 +57,13 @@ impl BrowserSession {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() { bail!("Phiên native không phản hồi: {method}"); }
                 self.socket.get_ref().set_read_timeout(Some(read_timeout.unwrap_or(timeout).min(remaining)))?;
-                match self.socket.read()? {
+                let message = match self.socket.read() {
+                    Ok(message) => message,
+                    // Windows reports socket read timeouts as WSAETIMEDOUT (os error 10060), not WouldBlock.
+                    Err(tungstenite::Error::Io(error)) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                match message {
                     Message::Text(text) => {
                         let mut frame: Value = serde_json::from_str(&text)?;
                         if frame["id"].as_u64() != Some(id) { continue; }
@@ -136,6 +146,25 @@ mod tests {
         let endpoint = BrowserSession::endpoint(&format!("WebDriver BiDi listening on ws://127.0.0.1:{port}")).unwrap();
         let error = BrowserSession::connect(&endpoint,&[123]).err().expect("Unowned process must be rejected");
         assert!(error.to_string().contains("không thuộc tiến trình"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn waits_for_slow_session_new_beyond_socket_read_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            let request: Value = serde_json::from_str(socket.read().unwrap().to_text().unwrap()).unwrap();
+            std::thread::sleep(Duration::from_millis(3500));
+            socket.send(Message::Text(json!({"type":"success","id":request["id"],"result":{"capabilities":{"moz:processID":999}}}).to_string().into())).unwrap();
+            let _ = socket.read();
+        });
+        let endpoint = BrowserSession::endpoint(&format!("WebDriver BiDi listening on ws://127.0.0.1:{port}")).unwrap();
+        let session = BrowserSession::connect(&endpoint, &[999]).expect("Slow browser startup must not fail with a socket timeout");
+        drop(session);
         server.join().unwrap();
     }
 }

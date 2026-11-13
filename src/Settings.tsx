@@ -597,7 +597,7 @@ export default function Settings({ snapshot, onRefresh, onMessage }: PageProps) 
 
           <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
             <div style={{ fontSize: 12 }}>
-              <strong>CamouManager v{snapshot.app_update?.current_version || '1.0.10'}</strong>
+              <strong>CamouManager v{snapshot.app_update?.current_version || '1.0.11'}</strong>
               {snapshot.app_update?.state === 'ready' ? (
                 <div style={{ color: 'var(--success)', marginTop: 2 }}>
                   {t(

@@ -43,9 +43,13 @@ export default function Profiles({
   const [proxyFilter, setProxyFilter] = useState('ALL');
   const [sortMode, setSortMode] = useState<SortMode>('name_asc');
 
+  const [pageSize, setPageSize] = useState<number>(50);
+  const [currentPage, setCurrentPage] = useState<number>(1);
   // Selection state preserved across filter/status updates
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [busyAction, setBusyAction] = useState(false);
+  const [editingCell, setEditingCell] = useState<{ id: string; field: 'tags' | 'note' } | null>(null);
+  const [editingValue, setEditingValue] = useState('');
 
   // Row / View menus
   const [rowMenu, setRowMenu] = useState<{ profileId: string; x: number; y: number } | null>(null);
@@ -314,6 +318,18 @@ export default function Profiles({
     locale,
   ]);
 
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [debouncedSearch, debouncedTagFilter, groupFilter, statusFilter, proxyFilter, sortMode, pageSize]);
+
+  const totalPages = pageSize > 0 ? Math.max(1, Math.ceil(filteredProfiles.length / pageSize)) : 1;
+  const safePage = Math.min(currentPage, totalPages);
+  const pagedProfiles = useMemo(() => {
+    if (pageSize <= 0) return filteredProfiles;
+    const start = (safePage - 1) * pageSize;
+    return filteredProfiles.slice(start, start + pageSize);
+  }, [filteredProfiles, pageSize, safePage]);
+
   const profileMapRef = useRef<Map<string, Profile>>(new Map());
   useEffect(() => {
     const map = new Map<string, Profile>();
@@ -453,6 +469,53 @@ export default function Profiles({
     setBackupUnencryptedConfirm(false);
   }, []);
 
+  const quickAssignProxy = useCallback(
+    async (profileId: string, proxyId: string) => {
+      try {
+        await request<null>('profile.assign_proxy', { ids: [profileId], proxy_id: proxyId });
+        await onRefresh();
+      } catch (err) {
+        onMessage(
+          t(
+            `Lỗi gán proxy: ${err instanceof Error ? err.message : String(err)}`,
+            `Failed to assign proxy: ${err instanceof Error ? err.message : String(err)}`
+          ),
+          'error'
+        );
+      }
+    },
+    [onMessage, onRefresh, t]
+  );
+
+  const commitInlineEdit = useCallback(
+    async (row: Profile, field: 'tags' | 'note', rawValue: string) => {
+      setEditingCell(null);
+      if (row.state === 'running') return;
+      try {
+        if (field === 'tags') {
+          const nextTags = rawValue.split(',').map((s) => s.trim()).filter(Boolean);
+          const prevTags = (row.tags || []).join(', ');
+          if (nextTags.join(', ') === prevTags) return;
+          await request<Profile>('profile.update', { id: row.id, data: { tags: nextTags } });
+        } else {
+          const nextNote = rawValue.trim();
+          if (nextNote === (row.note || '').trim()) return;
+          await request<Profile>('profile.update', { id: row.id, data: { note: nextNote } });
+        }
+        await onRefresh();
+      } catch (err) {
+        onMessage(
+          t(
+            `Lỗi cập nhật: ${err instanceof Error ? err.message : String(err)}`,
+            `Failed to update: ${err instanceof Error ? err.message : String(err)}`
+          ),
+          'error'
+        );
+      }
+    },
+    [onMessage, onRefresh, t]
+  );
+
   const columns: Column<Profile>[] = useMemo(
     () => [
       {
@@ -495,34 +558,115 @@ export default function Profiles({
         key: 'tags',
         header: t('Thẻ', 'Tags'),
         flex: 1,
-        render: (row) => (
-          <span className="cm-muted-text" title={(row.tags || []).join(', ')}>
-            {row.tags && row.tags.length > 0 ? row.tags.join(', ') : '-'}
-          </span>
-        ),
+        render: (row) => {
+          const isEditing = editingCell?.id === row.id && editingCell.field === 'tags';
+          if (isEditing) {
+            return (
+              <input
+                type="text"
+                autoFocus
+                value={editingValue}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => setEditingValue(e.target.value)}
+                onBlur={() => void commitInlineEdit(row, 'tags', editingValue)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    void commitInlineEdit(row, 'tags', editingValue);
+                  } else if (e.key === 'Escape') {
+                    setEditingCell(null);
+                  }
+                }}
+                style={{ width: '100%', padding: '2px 6px', fontSize: 12 }}
+                placeholder="tag1, tag2..."
+              />
+            );
+          }
+          const text = row.tags && row.tags.length > 0 ? row.tags.join(', ') : '-';
+          return (
+            <span
+              className="cm-muted-text"
+              title={row.state === 'running' ? text : t('Bấm để sửa thẻ', 'Click to edit tags')}
+              style={{ cursor: row.state === 'running' ? 'default' : 'pointer', display: 'block', width: '100%' }}
+              onClick={(e) => {
+                if (row.state === 'running') return;
+                e.stopPropagation();
+                setEditingCell({ id: row.id, field: 'tags' });
+                setEditingValue((row.tags || []).join(', '));
+              }}
+            >
+              {text}
+            </span>
+          );
+        },
       },
       {
         key: 'note',
         header: t('Ghi chú', 'Notes'),
         flex: 1,
-        render: (row) => (
-          <span className="cm-muted-text" title={row.note || ''}>
-            {row.note && row.note.trim() ? row.note.trim() : '-'}
-          </span>
-        ),
+        render: (row) => {
+          const isEditing = editingCell?.id === row.id && editingCell.field === 'note';
+          if (isEditing) {
+            return (
+              <input
+                type="text"
+                autoFocus
+                value={editingValue}
+                onClick={(e) => e.stopPropagation()}
+                onChange={(e) => setEditingValue(e.target.value)}
+                onBlur={() => void commitInlineEdit(row, 'note', editingValue)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    void commitInlineEdit(row, 'note', editingValue);
+                  } else if (e.key === 'Escape') {
+                    setEditingCell(null);
+                  }
+                }}
+                style={{ width: '100%', padding: '2px 6px', fontSize: 12 }}
+                placeholder={t('Ghi chú...', 'Note...')}
+              />
+            );
+          }
+          const text = row.note && row.note.trim() ? row.note.trim() : '-';
+          return (
+            <span
+              className="cm-muted-text"
+              title={row.state === 'running' ? text : t('Bấm để sửa ghi chú', 'Click to edit note')}
+              style={{ cursor: row.state === 'running' ? 'default' : 'pointer', display: 'block', width: '100%' }}
+              onClick={(e) => {
+                if (row.state === 'running') return;
+                e.stopPropagation();
+                setEditingCell({ id: row.id, field: 'note' });
+                setEditingValue(row.note || '');
+              }}
+            >
+              {text}
+            </span>
+          );
+        },
       },
       {
         key: 'proxy',
         header: t('Proxy / VPN', 'Proxy / VPN'),
         flex: 1,
-        render: (row) => {
-          const display = row.proxy_name || (!row.proxy_id ? t('Trực tiếp', 'Direct') : t('Proxy đã gán', 'Assigned proxy'));
-          return (
-            <span className={row.proxy_id ? '' : 'cm-muted-text'} title={display}>
-              {display}
-            </span>
-          );
-        },
+        render: (row) => (
+          <select
+            aria-label={t(`Proxy cho ${row.name}`, `Proxy for ${row.name}`)}
+            value={row.proxy_id || ''}
+            disabled={row.state === 'running'}
+            onClick={(e) => e.stopPropagation()}
+            onChange={(e) => void quickAssignProxy(row.id, e.target.value)}
+            style={{ width: '100%', padding: '2px 6px', fontSize: 12 }}
+          >
+            <option value="">{t('Trực tiếp', 'Direct')}</option>
+            {snapshot.proxies.map((px) => (
+              <option key={px.id} value={px.id}>
+                {px.name || px.server || px.id}
+              </option>
+            ))}
+          </select>
+        ),
       },
       {
         key: 'ext',
@@ -601,7 +745,7 @@ export default function Profiles({
         },
       },
     ],
-    [sortMode, toggleRowSelection, stopProfiles, launchProfiles, t]
+    [sortMode, toggleRowSelection, stopProfiles, launchProfiles, editingCell, editingValue, snapshot.proxies, quickAssignProxy, commitInlineEdit, t]
   );
 
   const activeMenuProfile = rowMenu ? profileMapRef.current.get(rowMenu.profileId) || null : null;
@@ -1091,14 +1235,6 @@ export default function Profiles({
             <option value="oldest">{t('Cũ nhất', 'Oldest')}</option>
           </select>
 
-          <Button
-            variant="secondary"
-            size="sm"
-            onClick={() => onRefresh()}
-            title={t('Làm mới dữ liệu', 'Refresh data')}
-          >
-            {t('Làm mới', 'Refresh')}
-          </Button>
         </div>
       </div>
 
@@ -1126,11 +1262,17 @@ export default function Profiles({
             <input
               id="filter-tag"
               type="text"
+              list="filter-tag-options"
               value={tagFilterInput}
               onChange={(e) => setTagFilterInput(e.target.value)}
               placeholder={t('Lọc thẻ...', 'Filter tags...')}
-              style={{ width: 130 }}
+              style={{ width: 150 }}
             />
+            <datalist id="filter-tag-options">
+              {availableTags.map((tag) => (
+                <option key={tag} value={tag} />
+              ))}
+            </datalist>
           </div>
 
           <div className="cm-filter-item">
@@ -1200,22 +1342,90 @@ export default function Profiles({
             }}
           />
         ) : (
-          <VirtualTable
-            rows={filteredProfiles}
-            rowKey={(r) => r.id}
-            columns={columns}
-            rowHeight={44}
-            selectedKeys={selectedIds}
-            onRowDoubleClick={openEditModal}
-            onRowContextMenu={(row, e) => {
-              e.preventDefault();
-              setRowMenu({
-                profileId: row.id,
-                x: Math.min(e.clientX, window.innerWidth - 220),
-                y: Math.min(e.clientY, window.innerHeight - 260),
-              });
-            }}
-          />
+          <>
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              <VirtualTable
+                key={safePage}
+                rows={pagedProfiles}
+                rowKey={(r) => r.id}
+                columns={columns}
+                rowHeight={44}
+                selectedKeys={selectedIds}
+                onRowDoubleClick={openEditModal}
+                onRowContextMenu={(row, e) => {
+                  e.preventDefault();
+                  setRowMenu({
+                    profileId: row.id,
+                    x: Math.min(e.clientX, window.innerWidth - 220),
+                    y: Math.min(e.clientY, window.innerHeight - 260),
+                  });
+                }}
+              />
+            </div>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '8px 16px',
+                borderTop: '1px solid var(--border)',
+                backgroundColor: 'var(--bg-main)',
+                fontSize: 12,
+                gap: 12,
+                flexWrap: 'wrap',
+              }}
+            >
+              <div className="cm-row" style={{ gap: 8 }}>
+                <span className="cm-muted-text">
+                  {filteredProfiles.length === 0
+                    ? t('0 profile', '0 profiles')
+                    : pageSize <= 0
+                      ? t(`Hiển thị tất cả ${filteredProfiles.length} profile`, `Showing all ${filteredProfiles.length} profiles`)
+                      : t(
+                          `Hiển thị ${(safePage - 1) * pageSize + 1}–${Math.min(safePage * pageSize, filteredProfiles.length)} / ${filteredProfiles.length} profile`,
+                          `Showing ${(safePage - 1) * pageSize + 1}–${Math.min(safePage * pageSize, filteredProfiles.length)} of ${filteredProfiles.length} profiles`
+                        )}
+                </span>
+                <select
+                  aria-label={t('Số profile mỗi trang', 'Profiles per page')}
+                  value={pageSize}
+                  onChange={(e) => setPageSize(Number(e.target.value))}
+                  style={{ padding: '2px 6px', fontSize: 12 }}
+                >
+                  <option value={25}>25 / {t('trang', 'page')}</option>
+                  <option value={50}>50 / {t('trang', 'page')}</option>
+                  <option value={100}>100 / {t('trang', 'page')}</option>
+                  <option value={200}>200 / {t('trang', 'page')}</option>
+                  <option value={0}>{t('Tất cả', 'All')}</option>
+                </select>
+              </div>
+              {pageSize > 0 && totalPages > 1 ? (
+                <div className="cm-row" style={{ gap: 6 }}>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={safePage <= 1}
+                    onClick={() => setCurrentPage(Math.max(1, safePage - 1))}
+                    aria-label={t('Trang trước', 'Previous page')}
+                  >
+                    ‹
+                  </Button>
+                  <span className="cm-muted-text" style={{ minWidth: 72, textAlign: 'center' }}>
+                    {t(`Trang ${safePage} / ${totalPages}`, `Page ${safePage} / ${totalPages}`)}
+                  </span>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={safePage >= totalPages}
+                    onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                    aria-label={t('Trang sau', 'Next page')}
+                  >
+                    ›
+                  </Button>
+                </div>
+              ) : null}
+            </div>
+          </>
         )}
       </div>
 

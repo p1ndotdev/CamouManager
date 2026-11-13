@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { openPath, request, savePath } from './api';
-import { Button, Column, ConfirmDialog, EmptyState, Field, Modal, StatusBadge, VirtualTable } from './components';
+import { Button, Column, ConfirmDialog, EmptyState, Field, GroupSelector, Modal, StatusBadge, TagsSelector, VirtualTable } from './components';
 import ProfileEditor from './ProfileEditor';
 import { useI18n } from './i18n';
 import type {
@@ -238,6 +238,17 @@ export default function Profiles({
     for (const p of snapshot.profiles) {
       const g = (p.group || '').trim();
       if (g) set.add(g);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b, locale));
+  }, [snapshot.profiles, locale]);
+
+  const availableTags = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of snapshot.profiles) {
+      for (const tag of p.tags || []) {
+        const clean = tag.trim();
+        if (clean) set.add(clean);
+      }
     }
     return Array.from(set).sort((a, b) => a.localeCompare(b, locale));
   }, [snapshot.profiles, locale]);
@@ -1616,17 +1627,17 @@ export default function Profiles({
         >
           <Field
             label={t(
-              `Nhập tên nhóm cho ${selectedIds.size} profile (để trống để xóa nhóm):`,
-              `Enter group name for ${selectedIds.size} selected profile${selectedIds.size > 1 ? 's' : ''} (leave blank to clear group):`
+              `Chọn hoặc tạo nhóm mới cho ${selectedIds.size} profile:`,
+              `Choose or create a group for ${selectedIds.size} selected profile${selectedIds.size > 1 ? 's' : ''}:`
             )}
             htmlFor="batch-group-input"
           >
-            <input
+            <GroupSelector
               id="batch-group-input"
-              type="text"
               value={batchGroupText}
-              onChange={(e) => setBatchGroupText(e.target.value)}
-              placeholder={t('Ví dụ: Facebook, Marketing...', 'e.g. Facebook, Marketing...')}
+              options={availableGroups}
+              onChange={setBatchGroupText}
+              placeholder={t('Nhập tên nhóm mới...', 'Enter new group name...')}
             />
           </Field>
         </Modal>
@@ -1653,16 +1664,16 @@ export default function Profiles({
         >
           <Field
             label={t(
-              `Nhập danh sách thẻ cho ${selectedIds.size} profile (phân cách bởi dấu phẩy):`,
-              `Enter tags for ${selectedIds.size} selected profile${selectedIds.size > 1 ? 's' : ''} (separated by commas):`
+              `Chọn thẻ sẵn có hoặc nhập thêm (cách bởi dấu phẩy) cho ${selectedIds.size} profile:`,
+              `Pick existing tags or type new ones (comma separated) for ${selectedIds.size} selected profile${selectedIds.size > 1 ? 's' : ''}:`
             )}
             htmlFor="batch-tags-input"
           >
-            <input
+            <TagsSelector
               id="batch-tags-input"
-              type="text"
               value={batchTagsText}
-              onChange={(e) => setBatchTagsText(e.target.value)}
+              options={availableTags}
+              onChange={setBatchTagsText}
               placeholder={t('Ví dụ: clone, shop1, test...', 'e.g. clone, shop1, test...')}
             />
           </Field>

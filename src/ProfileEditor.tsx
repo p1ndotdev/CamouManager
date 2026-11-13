@@ -1,6 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { openPath, request } from './api';
-import { Button, Field, Modal } from './components';
+import { Button, Field, GroupSelector, Modal, TagsSelector } from './components';
 import { useI18n } from './i18n';
 import type { AppSnapshot, Location, MessageLevel, Profile, ProxyCheck } from './types';
 
@@ -24,7 +24,7 @@ export default function ProfileEditor({
   onSaved,
   onMessage,
 }: ProfileEditorProps) {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const [activeTab, setActiveTab] = useState<EditorTab>('general');
   const [savedProfile, setSavedProfile] = useState<Profile | null>(profile);
   const [loadingFull, setLoadingFull] = useState(false);
@@ -42,6 +42,26 @@ export default function ProfileEditor({
   const [versionNotice, setVersionNotice] = useState(false);
   const [presetNotice, setPresetNotice] = useState(false);
 
+
+  const availableGroups = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of snapshot.profiles) {
+      const g = (p.group || '').trim();
+      if (g) set.add(g);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b, locale));
+  }, [snapshot.profiles, locale]);
+
+  const availableTags = useMemo(() => {
+    const set = new Set<string>();
+    for (const p of snapshot.profiles) {
+      for (const tag of p.tags || []) {
+        const clean = tag.trim();
+        if (clean) set.add(clean);
+      }
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b, locale));
+  }, [snapshot.profiles, locale]);
   // Tab 2: Proxy & Network
   const [proxyMode, setProxyMode] = useState<ProxyMode>('default');
   const [selectedProxyId, setSelectedProxyId] = useState('');
@@ -563,20 +583,20 @@ export default function ProfileEditor({
 
           <div className="cm-grid-2">
             <Field label={t('Nhóm:', 'Group:')} htmlFor="profile-group">
-              <input
+              <GroupSelector
                 id="profile-group"
-                type="text"
                 value={group}
-                onChange={(e) => setGroup(e.target.value)}
-                placeholder={t('Ví dụ: Facebook, E-commerce, Marketing...', 'e.g. Facebook, E-commerce, Marketing...')}
+                options={availableGroups}
+                onChange={setGroup}
+                placeholder={t('Nhập tên nhóm mới...', 'Enter new group name...')}
               />
             </Field>
-            <Field label={t('Thẻ (phân cách bởi dấu phẩy):', 'Tags (comma separated):')} htmlFor="profile-tags">
-              <input
+            <Field label={t('Thẻ (chọn sẵn hoặc nhập mới, cách bởi dấu phẩy):', 'Tags (pick or type new, comma separated):')} htmlFor="profile-tags">
+              <TagsSelector
                 id="profile-tags"
-                type="text"
                 value={tagsText}
-                onChange={(e) => setTagsText(e.target.value)}
+                options={availableTags}
+                onChange={setTagsText}
                 placeholder="tag1, tag2, proxy_us..."
               />
             </Field>

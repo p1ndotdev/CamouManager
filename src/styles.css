@@ -234,6 +234,50 @@ body,
   font-size: 12px;
 }
 
+.cm-tag-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  max-height: 112px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.cm-tag-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background-color: var(--bg-card);
+  color: var(--text-secondary);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.1s ease, border-color 0.1s ease, color 0.1s ease;
+}
+
+.cm-tag-chip:hover {
+  background-color: var(--hover);
+  color: var(--text-primary);
+}
+
+.cm-tag-chip-active {
+  background-color: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+.cm-tag-chip-active:hover {
+  background-color: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: var(--accent-text);
+}
+
 /* Buttons */
 .cm-btn {
   display: inline-flex;

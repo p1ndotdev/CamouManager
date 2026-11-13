@@ -518,3 +518,115 @@ export function formatBytes(bytes?: number | null): string {
   if (num < 1024 * 1024 * 1024) return `${(num / (1024 * 1024)).toFixed(2)} MB`;
   return `${(num / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
+
+export interface GroupSelectorProps {
+  id?: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  placeholder?: string;
+}
+
+export function GroupSelector({ id, value, options, onChange, placeholder }: GroupSelectorProps) {
+  const { t } = useI18n();
+  const [customMode, setCustomMode] = useState(false);
+  const prevOptionsRef = useRef(options);
+  useEffect(() => {
+    if (prevOptionsRef.current !== options) {
+      prevOptionsRef.current = options;
+      if (value !== '' && options.includes(value)) {
+        setCustomMode(false);
+      }
+    }
+  }, [options, value]);
+  const isCustom = customMode || (value !== '' && !options.includes(value));
+  return (
+    <>
+      <select
+        id={id}
+        value={isCustom ? '__NEW__' : value}
+        onChange={(e) => {
+          const next = e.target.value;
+          if (next === '__NEW__') {
+            setCustomMode(true);
+            if (options.includes(value)) onChange('');
+          } else {
+            setCustomMode(false);
+            onChange(next);
+          }
+        }}
+      >
+        <option value="">{t('Không có nhóm', 'No group')}</option>
+        {options.map((g) => (
+          <option key={g} value={g}>
+            {g}
+          </option>
+        ))}
+        <option value="__NEW__">{t('+ Tạo nhóm mới...', '+ Create new group...')}</option>
+      </select>
+      {isCustom ? (
+        <input
+          type="text"
+          autoFocus
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+        />
+      ) : null}
+    </>
+  );
+}
+
+export interface TagsSelectorProps {
+  id?: string;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  placeholder?: string;
+}
+
+export function TagsSelector({ id, value, options, onChange, placeholder }: TagsSelectorProps) {
+  const selected = value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const selectedSet = new Set(selected);
+
+  const toggleTag = (tag: string) => {
+    const next = selectedSet.has(tag)
+      ? selected.filter((item) => item !== tag)
+      : [...selected, tag];
+    onChange(next.join(', '));
+  };
+
+  return (
+    <>
+      <input
+        id={id}
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+      />
+      {options.length > 0 ? (
+        <div className="cm-tag-picker">
+          {options.map((tag) => {
+            const active = selectedSet.has(tag);
+            return (
+              <button
+                key={tag}
+                type="button"
+                className={`cm-tag-chip ${active ? 'cm-tag-chip-active' : ''}`}
+                onClick={() => toggleTag(tag)}
+                aria-pressed={active}
+              >
+                <span>{active ? '✓' : '+'}</span>
+                <span>{tag}</span>
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
+    </>
+  );
+}

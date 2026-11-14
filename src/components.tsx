@@ -583,9 +583,10 @@ export interface TagsSelectorProps {
   options: string[];
   onChange: (value: string) => void;
   placeholder?: string;
+  autoFocus?: boolean;
 }
 
-export function TagsSelector({ id, value, options, onChange, placeholder }: TagsSelectorProps) {
+export function TagsSelector({ id, value, options, onChange, placeholder, autoFocus }: TagsSelectorProps) {
   const selected = value
     .split(',')
     .map((s) => s.trim())
@@ -604,6 +605,7 @@ export function TagsSelector({ id, value, options, onChange, placeholder }: Tags
       <input
         id={id}
         type="text"
+        autoFocus={autoFocus}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
@@ -618,6 +620,7 @@ export function TagsSelector({ id, value, options, onChange, placeholder }: Tags
                 type="button"
                 className={`cm-tag-chip ${active ? 'cm-tag-chip-active' : ''}`}
                 onClick={() => toggleTag(tag)}
+                onKeyDown={(e) => { if (e.key === 'Enter') e.stopPropagation(); }}
                 aria-pressed={active}
               >
                 <span>{active ? '✓' : '+'}</span>

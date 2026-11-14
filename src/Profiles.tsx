@@ -48,8 +48,10 @@ export default function Profiles({
   // Selection state preserved across filter/status updates
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [busyAction, setBusyAction] = useState(false);
-  const [editingCell, setEditingCell] = useState<{ id: string; field: 'tags' | 'note' } | null>(null);
+  const [editingCell, setEditingCell] = useState<{ id: string; field: 'note' } | null>(null);
   const [editingValue, setEditingValue] = useState('');
+  const [tagPopover, setTagPopover] = useState<{ profileId: string; x: number; y: number } | null>(null);
+  const [tagPopoverText, setTagPopoverText] = useState('');
 
   // Row / View menus
   const [rowMenu, setRowMenu] = useState<{ profileId: string; x: number; y: number } | null>(null);
@@ -559,40 +561,22 @@ export default function Profiles({
         header: t('Thẻ', 'Tags'),
         flex: 1,
         render: (row) => {
-          const isEditing = editingCell?.id === row.id && editingCell.field === 'tags';
-          if (isEditing) {
-            return (
-              <input
-                type="text"
-                autoFocus
-                value={editingValue}
-                onClick={(e) => e.stopPropagation()}
-                onChange={(e) => setEditingValue(e.target.value)}
-                onBlur={() => void commitInlineEdit(row, 'tags', editingValue)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    void commitInlineEdit(row, 'tags', editingValue);
-                  } else if (e.key === 'Escape') {
-                    setEditingCell(null);
-                  }
-                }}
-                style={{ width: '100%', padding: '2px 6px', fontSize: 12 }}
-                placeholder="tag1, tag2..."
-              />
-            );
-          }
           const text = row.tags && row.tags.length > 0 ? row.tags.join(', ') : '-';
           return (
             <span
               className="cm-muted-text"
-              title={row.state === 'running' ? text : t('Bấm để sửa thẻ', 'Click to edit tags')}
+              title={row.state === 'running' ? text : t('Bấm để chọn hoặc tạo thẻ', 'Click to pick or add tags')}
               style={{ cursor: row.state === 'running' ? 'default' : 'pointer', display: 'block', width: '100%' }}
               onClick={(e) => {
                 if (row.state === 'running') return;
                 e.stopPropagation();
-                setEditingCell({ id: row.id, field: 'tags' });
-                setEditingValue((row.tags || []).join(', '));
+                const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                setTagPopover({
+                  profileId: row.id,
+                  x: Math.min(rect.left, window.innerWidth - 290),
+                  y: Math.min(rect.bottom + 4, window.innerHeight - 260),
+                });
+                setTagPopoverText((row.tags || []).join(', '));
               }}
             >
               {text}
@@ -1429,6 +1413,63 @@ export default function Profiles({
         )}
       </div>
 
+
+      {/* Inline Row Tags Picker Popover */}
+      {tagPopover && profileMapRef.current.get(tagPopover.profileId) ? (
+        <>
+          <div
+            className="cm-menu-backdrop"
+            onClick={() => {
+              const p = profileMapRef.current.get(tagPopover.profileId);
+              setTagPopover(null);
+              if (p) void commitInlineEdit(p, 'tags', tagPopoverText);
+            }}
+          />
+          <div
+            className="cm-menu"
+            style={{ left: tagPopover.x, top: tagPopover.y, width: 280, padding: 10, gap: 8 }}
+            role="dialog"
+            aria-label={t('Chọn hoặc tạo thẻ', 'Pick or add tags')}
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') {
+                setTagPopover(null);
+              } else if (e.key === 'Enter' && (e.target as HTMLElement).tagName === 'INPUT') {
+                e.preventDefault();
+                const p = profileMapRef.current.get(tagPopover.profileId);
+                setTagPopover(null);
+                if (p) void commitInlineEdit(p, 'tags', tagPopoverText);
+              }
+            }}
+          >
+            <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)' }}>
+              {t('Chọn thẻ hoặc nhập mới:', 'Pick existing or type new tags:')}
+            </div>
+            <TagsSelector
+              value={tagPopoverText}
+              options={availableTags}
+              onChange={setTagPopoverText}
+              autoFocus
+              placeholder={t('Nhập thẻ mới (cách bởi dấu phẩy)...', 'Type new tags (comma separated)...')}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6, marginTop: 2 }}>
+              <Button variant="ghost" size="sm" onClick={() => setTagPopover(null)}>
+                {t('Hủy', 'Cancel')}
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => {
+                  const p = profileMapRef.current.get(tagPopover.profileId);
+                  setTagPopover(null);
+                  if (p) void commitInlineEdit(p, 'tags', tagPopoverText);
+                }}
+              >
+                {t('Lưu', 'Save')}
+              </Button>
+            </div>
+          </div>
+        </>
+      ) : null}
 
       {/* Row Context / Action Menu */}
       {rowMenu && activeMenuProfile ? (

@@ -306,3 +306,65 @@ fn bulk_set_version_retargets_ua_preserves_identity_and_rolls_back_on_error() {
     backend.request("profile.set_version", json!({"ids": [id1], "browser_version": ""}), None).unwrap();
     assert_eq!(backend.profiles.get(id1).unwrap()["browser_version"], "");
 }
+
+#[test]
+fn distribute_proxies_spreads_over_enabled_pool_and_reuses_when_short() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Backend::open(root.path().to_owned()).unwrap();
+    let first = backend.network.save(json!({"name": "A proxy", "server": "socks5://127.0.0.1:1081"})).unwrap();
+    let second = backend.network.save(json!({"name": "B proxy", "server": "socks5://127.0.0.1:1082"})).unwrap();
+    let disabled = backend.network.save(json!({"name": "C disabled", "server": "socks5://127.0.0.1:1083", "enabled": false})).unwrap();
+    let ids: Vec<String> = (0..5)
+        .map(|index| create(&backend, &format!("Spread {index}"))["id"].as_str().unwrap().to_owned())
+        .collect();
+
+    // 5 profiles, 2 enabled proxies: every profile gets one, counts sum to 5 and stay balanced, disabled proxy untouched.
+    let summary = backend.request("profile.distribute_proxies", json!({"ids": ids}), None).unwrap();
+    let rows = summary.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    let mut counts: Vec<u64> = rows.iter().map(|row| row["count"].as_u64().unwrap()).collect();
+    counts.sort();
+    assert_eq!(counts, vec![2, 3]);
+    assert_eq!(counts.iter().sum::<u64>(), ids.len() as u64);
+    assert!(counts.iter().all(|count| *count <= 3));
+    let used: Vec<String> = ids
+        .iter()
+        .map(|id| backend.profiles.get(id).unwrap()["proxy_id"].as_str().unwrap().to_owned())
+        .collect();
+    let first_id = first["id"].as_str().unwrap();
+    let second_id = second["id"].as_str().unwrap();
+    assert!(used.iter().all(|px| px == first_id || px == second_id));
+    assert!(!used.contains(&disabled["id"].as_str().unwrap().to_owned()));
+
+    // 3 enabled proxies, 2 profiles: no reuse, each profile gets a different proxy.
+    backend.network.save(json!({"name": "D proxy", "server": "socks5://127.0.0.1:1084"})).unwrap();
+    let summary = backend.request("profile.distribute_proxies", json!({"ids": ids[..2].to_vec()}), None).unwrap();
+    let rows = summary.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row["count"] == 1));
+    let distinct: Vec<String> = ids[..2]
+        .iter()
+        .map(|id| backend.profiles.get(id).unwrap()["proxy_id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_ne!(distinct[0], distinct[1]);
+}
+
+#[test]
+fn distribute_proxies_rejects_unknown_profile_without_partial_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let backend = Backend::open(root.path().to_owned()).unwrap();
+    backend.network.save(json!({"name": "A proxy", "server": "socks5://127.0.0.1:1081"})).unwrap();
+    backend.network.save(json!({"name": "B proxy", "server": "socks5://127.0.0.1:1082"})).unwrap();
+    let ids: Vec<String> = (0..3)
+        .map(|index| create(&backend, &format!("Atomic {index}"))["id"].as_str().unwrap().to_owned())
+        .collect();
+
+    let mut with_missing = ids.clone();
+    with_missing.push("00000000000000000000000000000000".to_string());
+    assert!(backend.request("profile.distribute_proxies", json!({"ids": with_missing}), None).is_err());
+
+    // Preflight aborts before any write: every profile keeps its direct connection.
+    for id in &ids {
+        assert_eq!(backend.profiles.get(id).unwrap()["proxy_id"], "");
+    }
+}

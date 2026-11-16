@@ -76,6 +76,7 @@ export default function Profiles({
 
   const [batchProxyOpen, setBatchProxyOpen] = useState(false);
   const [batchProxyId, setBatchProxyId] = useState('');
+  const [batchProxyAuto, setBatchProxyAuto] = useState(false);
   const [batchProxySaving, setBatchProxySaving] = useState(false);
 
   const [batchTagsOpen, setBatchTagsOpen] = useState(false);
@@ -853,6 +854,42 @@ export default function Profiles({
     }
   };
 
+  const handleBatchDistributeProxy = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    setBatchProxySaving(true);
+    try {
+      const summary = await request<{ proxy_id: string; count: number }[]>('profile.distribute_proxies', { ids });
+      setBatchProxyOpen(false);
+      await onRefresh();
+      const reused = summary.filter((row) => row.count > 1);
+      const repeated = reused
+        .slice(0, 4)
+        .map((row) => `${snapshot.proxies.find((px) => px.id === row.proxy_id)?.name || row.proxy_id} ×${row.count}`)
+        .join(', ');
+      const detail = reused.length
+        ? t(` Proxy dùng lại: ${repeated}${reused.length > 4 ? ', …' : ''}.`, ` Reused proxies: ${repeated}${reused.length > 4 ? ', …' : ''}.`)
+        : '';
+      onMessage(
+        t(
+          `Đã chia ${ids.length} profile cho ${summary.length} proxy.${detail}`,
+          `Distributed ${ids.length} profile${ids.length > 1 ? 's' : ''} across ${summary.length} prox${summary.length > 1 ? 'ies' : 'y'}.${detail}`
+        ),
+        'info'
+      );
+    } catch (err) {
+      onMessage(
+        t(
+          `Lỗi chia proxy tự động: ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to distribute proxies: ${err instanceof Error ? err.message : String(err)}`
+        ),
+        'error'
+      );
+    } finally {
+      setBatchProxySaving(false);
+    }
+  };
+
   const handleBatchSetTags = async () => {
     const ids = Array.from(selectedIds);
     if (ids.length === 0) return;
@@ -1149,6 +1186,7 @@ export default function Profiles({
                 disabled={busyAction}
                 onClick={() => {
                   setBatchProxyId('');
+                  setBatchProxyAuto(false);
                   setBatchProxyOpen(true);
                 }}
               >
@@ -1780,12 +1818,26 @@ export default function Profiles({
               <Button variant="secondary" onClick={() => setBatchProxyOpen(false)} disabled={batchProxySaving}>
                 {t('Hủy bỏ', 'Cancel')}
               </Button>
-              <Button variant="primary" onClick={handleBatchAssignProxy} loading={batchProxySaving}>
-                {t('Xác nhận gán', 'Confirm assign')}
+              <Button variant="primary" onClick={batchProxyAuto ? handleBatchDistributeProxy : handleBatchAssignProxy} loading={batchProxySaving}>
+                {batchProxyAuto ? t('Tự động chia proxy', 'Auto-assign proxies') : t('Xác nhận gán', 'Confirm assign')}
               </Button>
             </>
           }
         >
+          <div style={{ marginBottom: 12 }}>
+            <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 13, cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                className="cm-checkbox"
+                checked={batchProxyAuto}
+                onChange={(e) => setBatchProxyAuto(e.target.checked)}
+              />
+              {t(
+                'Tự động gán: mỗi profile một proxy đang bật trong kho (hết proxy thì dùng lại và báo proxy nào trùng)',
+                'Auto-assign: one enabled proxy per profile (reuses when the pool runs out and reports which proxies repeat)'
+              )}
+            </label>
+          </div>
           <Field
             label={t(
               `Chọn proxy để gán cho ${selectedIds.size} profile đã chọn:`,
@@ -1796,6 +1848,7 @@ export default function Profiles({
             <select
               id="batch-proxy-select"
               value={batchProxyId}
+              disabled={batchProxyAuto}
               onChange={(e) => setBatchProxyId(e.target.value)}
             >
               <option value="">{t('Không dùng proxy (Trực tiếp)', 'No proxy (Direct connection)')}</option>

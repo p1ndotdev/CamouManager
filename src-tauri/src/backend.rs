@@ -137,6 +137,7 @@ impl Backend {
             },
             "profile.stop_all" => { self.runtime.stop_all()?; Ok(Value::Null) },
             "profile.assign_proxy" => { self.profiles.set_many(&ids()?,"proxy_id",json!(string(&params,"proxy_id")))?; Ok(Value::Null) },
+            "profile.distribute_proxies" => Ok(json!(self.profiles.distribute_proxies(&ids()?)?)),
             "profile.set_tags" => { self.profiles.set_many(&ids()?,"tags",params["tags"].clone())?; Ok(Value::Null) },
             "profile.set_group" => { self.profiles.set_many(&ids()?,"group",json!(string(&params,"group")))?; Ok(Value::Null) },
             "profile.set_version" => { self.profiles.set_many(&ids()?,"browser_version",params.get("browser_version").cloned().unwrap_or_else(|| json!("")))?; Ok(Value::Null) },

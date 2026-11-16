@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use std::{collections::BTreeSet, fs, path::Path, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, fs, path::Path, sync::Arc};
 use crate::{files::{copy_tree, extract_zip, reject_link}, fingerprints::FingerprintService, network::Network, runtime::Runtime, store::{new_id, require_str, safe_component, string, utcnow, Store}};
 
 pub struct Profiles {
@@ -278,6 +278,47 @@ impl Profiles {
         self.store.put_many("profiles", records)?;
         Ok(())
     }
+    /// Spread enabled proxies over the selected profiles: one proxy per profile, reused when the pool is smaller.
+    pub fn distribute_proxies(&self, ids: &[String]) -> Result<Vec<Value>> {
+        let _guard = self.store.operation.lock();
+        let mut proxies: Vec<Value> = self
+            .store
+            .list("proxies")?
+            .into_iter()
+            .filter(|p| p.get("enabled").and_then(Value::as_bool).unwrap_or(true))
+            .collect();
+        if proxies.is_empty() {
+            bail!("Kho proxy không có proxy nào đang được kích hoạt để tự động gán");
+        }
+        // Least-used proxies first so repeated runs keep spreading load instead of piling onto one proxy.
+        let profiles = self.store.list("profiles")?;
+        let usage = |px_id: &str| profiles.iter().filter(|p| string(p, "proxy_id") == px_id).count();
+        proxies.sort_by(|a, b| {
+            usage(string(a, "id"))
+                .cmp(&usage(string(b, "id")))
+                .then_with(|| string(a, "name").cmp(string(b, "name")))
+                .then_with(|| string(a, "id").cmp(string(b, "id")))
+        });
+
+        let mut seen = BTreeSet::new();
+        let ordered: Vec<&String> = ids.iter().filter(|id| seen.insert((*id).clone())).collect();
+        for id in &ordered {
+            self.closed(id.as_str())?;
+        }
+
+        let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (index, id) in ordered.iter().enumerate() {
+            let px_id = string(&proxies[index % proxies.len()], "id").to_owned();
+            groups.entry(px_id).or_default().push((*id).clone());
+        }
+        let mut summary = Vec::with_capacity(groups.len());
+        for (px_id, group) in groups {
+            self.set_many(&group, "proxy_id", json!(px_id.clone()))?;
+            summary.push(json!({"proxy_id": px_id, "count": group.len()}));
+        }
+        Ok(summary)
+    }
+
     pub fn regenerate(&self, id: &str) -> Result<Value> {
         let _guard = self.store.operation.lock();
         let mut record = self.closed(id)?;

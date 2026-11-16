@@ -11,9 +11,12 @@ function normalizeProxyIp(value) {
   return ip;
 }
 
-async function probeIp(endpoint) {
+const PROBE_TOTAL_MS = 12000;
+const PROBE_PER_ENDPOINT_MS = 4000;
+
+async function probeIp(endpoint, budgetMs) {
   const controller = new AbortController();
-  const deadline = setTimeout(() => controller.abort(), 8000);
+  const deadline = setTimeout(() => controller.abort(), Math.min(PROBE_PER_ENDPOINT_MS, budgetMs));
   try {
     const response = await fetch(endpoint, { cache: 'no-store', signal: controller.signal });
     if (!response.ok) throw new Error(`Kiểm tra IP trả HTTP ${response.status}`);
@@ -33,10 +36,13 @@ async function probeIp(endpoint) {
 
 // Endpoints are ordered dual-stack, IPv4-only, IPv6-only: a tunnel with one family still reports its IP.
 async function resolveEgressIp() {
+  const startedAt = Date.now();
   let lastError = null;
   for (const endpoint of IP_SYNC_SETTINGS.endpoints) {
+    const budget = PROBE_TOTAL_MS - (Date.now() - startedAt);
+    if (budget <= 0) break;
     try {
-      return await probeIp(endpoint);
+      return await probeIp(endpoint, budget);
     } catch (error) {
       lastError = error;
     }

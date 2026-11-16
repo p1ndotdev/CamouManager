@@ -357,9 +357,13 @@ impl Network {
     }
 
     pub(crate) fn fetch_egress_ip(&self, client: &reqwest::blocking::Client) -> Result<String> {
+        // Whole probe stays under the 20s launch IP-sync window: 4s per endpoint, 12s total.
+        let deadline = Instant::now() + Duration::from_secs(12);
         let mut last_error = String::new();
         for url in self.egress_urls() {
-            let response = match client.get(&url).timeout(Duration::from_secs(8)).send() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { break; }
+            let response = match client.get(&url).timeout(remaining.min(Duration::from_secs(4))).send() {
                 Ok(response) if response.status().is_success() => response,
                 Ok(response) => { last_error = format!("{url}: HTTP {}", response.status()); continue; }
                 Err(error) => { last_error = format!("{url}: {}", redact(&error.to_string())); continue; }

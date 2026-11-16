@@ -1885,7 +1885,8 @@ impl Runtime {
                 .context("Bookmark addon preparation failed")?;
             addon_paths.push(browser_path_string(&bm_addon_dir));
             let ip_sync = if browser_proxy.is_some() {
-                let sync = IpSync::prepare(&profile_dir, self.network.egress_url(), &browser_proxy.as_ref().unwrap().prefs)?;
+                let endpoints = self.network.egress_urls();
+                let sync = IpSync::prepare(&profile_dir, &endpoints, &browser_proxy.as_ref().unwrap().prefs)?;
                 Some(sync)
             } else { None };
             // 7. Build and validate Camoufox config + startup preferences

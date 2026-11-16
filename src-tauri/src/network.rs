@@ -320,6 +320,8 @@ pub struct Network {
     #[cfg(test)]
     pub(crate) egress_url: Option<String>,
     #[cfg(test)]
+    pub(crate) egress_url_list: Option<Vec<String>>,
+    #[cfg(test)]
     pub(crate) geo_url: Option<String>,
 }
 
@@ -330,14 +332,55 @@ impl Network {
             #[cfg(test)]
             egress_url: None,
             #[cfg(test)]
+            egress_url_list: None,
+            #[cfg(test)]
             geo_url: None,
         }
     }
 
-    pub(crate) fn egress_url(&self) -> &str {
+    pub(crate) fn egress_urls(&self) -> Vec<String> {
         #[cfg(test)]
-        if let Some(url) = &self.egress_url { return url; }
-        "https://api.ipify.org?format=json"
+        if let Some(urls) = &self.egress_url_list { return urls.clone(); }
+        #[cfg(test)]
+        if let Some(url) = &self.egress_url { return vec![url.clone()]; }
+        // api4/api6 split: an IPv4-only or IPv6-only tunnel can still report its egress address.
+        [
+            "https://api.ipify.org?format=json",
+            "https://api4.ipify.org?format=json",
+            "https://api6.ipify.org?format=json",
+            "https://icanhazip.com",
+            "https://ipv6.icanhazip.com",
+        ]
+        .iter()
+        .map(|url| (*url).to_owned())
+        .collect()
+    }
+
+    pub(crate) fn fetch_egress_ip(&self, client: &reqwest::blocking::Client) -> Result<String> {
+        let mut last_error = String::new();
+        for url in self.egress_urls() {
+            let response = match client.get(&url).timeout(Duration::from_secs(8)).send() {
+                Ok(response) if response.status().is_success() => response,
+                Ok(response) => { last_error = format!("{url}: HTTP {}", response.status()); continue; }
+                Err(error) => { last_error = format!("{url}: {}", redact(&error.to_string())); continue; }
+            };
+            let Ok(text) = response.text() else { last_error = format!("{url}: unreadable body"); continue; };
+            let (candidate, missing) = match serde_json::from_str::<Value>(&text) {
+                Ok(data) => match data.get("ip").and_then(Value::as_str) {
+                    Some(ip) => (ip.to_owned(), false),
+                    None => (String::new(), true),
+                },
+                Err(_) => (text, false),
+            };
+            if missing {
+                last_error = format!("{url}: Proxy check returned missing IP address");
+                continue;
+            }
+            let candidate = candidate.trim();
+            if candidate.parse::<IpAddr>().is_ok() { return Ok(candidate.to_string()); }
+            last_error = format!("{url}: Proxy check returned invalid IP address: '{}'", redact(candidate));
+        }
+        bail!("Egress IP detection failed: {last_error}")
     }
 
     pub(crate) fn geo_url(&self, ip: &str) -> String {
@@ -576,63 +619,32 @@ impl Network {
                 }
             }
             Ok(client) => {
-                match client.get(self.egress_url()).send() {
-                    Ok(resp) => {
-                        let elapsed = t0.elapsed();
-                        let status = resp.status();
-                        if status.is_success() {
-                            if let Ok(data) = resp.json::<Value>() {
-                                let raw_ip = string(&data, "ip").trim();
-                                match raw_ip.parse::<IpAddr>() {
-                                    Ok(parsed_ip) => {
-                                        let ip = parsed_ip.to_string();
-                                        let latency = (elapsed.as_millis() as u64).max(1);
-
-                                        let mut country = String::new();
-                                        if !ip.is_empty() {
-                                            let geo_url = self.geo_url(&ip);
-                                            if let Ok(g_resp) = client.get(&geo_url).send() {
-                                                if g_resp.status().is_success() {
-                                                    if let Ok(g_data) = g_resp.json::<Value>() {
-                                                        let c_code = string(&g_data, "country_code");
-                                                        country = if !c_code.is_empty() {
-                                                            c_code.to_string()
-                                                        } else {
-                                                            string(&g_data, "country").to_string()
-                                                        };
-                                                    }
-                                                }
-                                            }
-                                        }
-
-                                        if let Some(map) = last_check.as_object_mut() {
-                                            map.insert("ok".into(), Value::Bool(true));
-                                            map.insert("latency_ms".into(), json!(latency));
-                                            map.insert("ip".into(), Value::String(ip));
-                                            map.insert("country".into(), Value::String(country));
-                                        }
-                                    }
-                                    Err(_) => {
-                                        if let Some(map) = last_check.as_object_mut() {
-                                            let err = if raw_ip.is_empty() {
-                                                "Proxy check returned missing IP address".to_string()
-                                            } else {
-                                                format!("Proxy check returned invalid IP address: '{}'", redact(raw_ip))
-                                            };
-                                            map.insert("error".into(), Value::String(err));
-                                        }
-                                    }
+                match self.fetch_egress_ip(&client) {
+                    Ok(ip) => {
+                        let latency = (t0.elapsed().as_millis() as u64).max(1);
+                        let mut country = String::new();
+                        if let Ok(g_resp) = client.get(self.geo_url(&ip)).timeout(Duration::from_secs(8)).send() {
+                            if g_resp.status().is_success() {
+                                if let Ok(g_data) = g_resp.json::<Value>() {
+                                    let c_code = string(&g_data, "country_code");
+                                    country = if !c_code.is_empty() {
+                                        c_code.to_string()
+                                    } else {
+                                        string(&g_data, "country").to_string()
+                                    };
                                 }
-                            } else if let Some(map) = last_check.as_object_mut() {
-                                map.insert("error".into(), Value::String("Phản hồi JSON không hợp lệ".into()));
                             }
-                        } else if let Some(map) = last_check.as_object_mut() {
-                            map.insert("error".into(), Value::String(format!("HTTP {}", status)));
+                        }
+                        if let Some(map) = last_check.as_object_mut() {
+                            map.insert("ok".into(), Value::Bool(true));
+                            map.insert("latency_ms".into(), json!(latency));
+                            map.insert("ip".into(), Value::String(ip));
+                            map.insert("country".into(), Value::String(country));
                         }
                     }
-                    Err(e) => {
+                    Err(error) => {
                         if let Some(map) = last_check.as_object_mut() {
-                            map.insert("error".into(), Value::String(redact(&e.to_string())));
+                            map.insert("error".into(), Value::String(redact(&format!("{error:#}"))));
                         }
                     }
                 }
@@ -688,30 +700,11 @@ impl Network {
         };
         let client = self.client_for(resolved.as_ref())?;
         // Step 1: Egress IP verification over HTTPS
-        let ip;
-        let ip_res1 = client
-            .get(self.egress_url())
-            .send()
-            .and_then(|r| r.json::<Value>());
-        match ip_res1 {
-            Ok(data) => {
-                ip = string(&data, "ip").trim().to_string();
-            }
-            Err(_) => {
-                let ip_res2 = client
-                    .get("https://icanhazip.com")
-                    .send()
-                    .and_then(|r| r.text());
-                match ip_res2 {
-                    Ok(txt) => ip = txt.trim().to_string(),
-                    Err(e) => {
-                        let err_msg = redact(&e.to_string());
-                        self.store.log("ERROR", &format!("Egress IP detection failed: {}", err_msg), "")?;
-                        bail!("Egress IP detection failed: {}", err_msg);
-                    }
-                }
-            }
-        }
+        let ip = self.fetch_egress_ip(&client).map_err(|error| {
+            let err_msg = redact(&format!("{error:#}"));
+            let _ = self.store.log("ERROR", &err_msg, "");
+            error
+        })?;
 
         // Validate IP payload before proceeding
         if ip.is_empty() || ip.parse::<IpAddr>().is_err() {
@@ -1150,6 +1143,36 @@ mod tests {
         assert_eq!(to_proxy_url(&cleared).unwrap(), to_proxy_url(&saved_clear).unwrap());
 
     }
+    #[test]
+    fn egress_probe_falls_back_to_next_endpoint_and_accepts_ipv6() {
+        use std::{io::{BufRead, BufReader, Write}, net::TcpListener};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = r#"{"ip":"2a09:bac1:7a80:10::23:434"}"#;
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                let _ = stream.flush();
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let mut net = Network::new(Arc::new(Store::open(root.path()).unwrap()));
+        net.egress_url_list = Some(vec![
+            "http://127.0.0.1:1/refused".to_string(),
+            format!("http://127.0.0.1:{port}/ipv6"),
+        ]);
+        let client = net.client_for(None).unwrap();
+        assert_eq!(net.fetch_egress_ip(&client).unwrap(), "2a09:bac1:7a80:10::23:434");
+        handle.join().unwrap();
+    }
+
     #[test]
     fn check_all_continues_when_proxy_returns_invalid_or_missing_ip() {
         use std::{io::{BufRead, BufReader, Write}, net::TcpListener};

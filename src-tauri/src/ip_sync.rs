@@ -12,7 +12,7 @@ pub(crate) struct IpSync {
 }
 
 impl IpSync {
-    pub(crate) fn prepare(profile_dir: &Path, endpoint: &str, proxy_prefs: &Value) -> Result<Self> {
+    pub(crate) fn prepare(profile_dir: &Path, endpoints: &[String], proxy_prefs: &Value) -> Result<Self> {
         let manager_dir = profile_dir.join("manager-addons");
         let addon_dir = manager_dir.join("ip-sync");
         for path in [profile_dir, &manager_dir, &addon_dir] { reject_link(path)?; }
@@ -20,12 +20,19 @@ impl IpSync {
         let token = new_id();
         let state_path = addon_dir.join("state.json");
         let state_tmp = addon_dir.join("state.json.tmp");
+        let mut permissions: Vec<String> = Vec::new();
+        for endpoint in endpoints {
+            let pattern = url::Url::parse(endpoint)?.join("/")?.as_str().to_owned() + "*";
+            if !permissions.contains(&pattern) {
+                permissions.push(pattern);
+            }
+        }
         let manifest = json!({
             "manifest_version": 2,
             "name": "CamouManager Proxy IP Monitor",
             "version": "1.0.0",
             "browser_specific_settings": {"gecko": {"id": "camoumanager-ip-sync@local.invalid"}},
-            "permissions": [url::Url::parse(endpoint)?.join("/")?.as_str().to_owned() + "*"],
+            "permissions": permissions,
             "background": {"scripts": ["settings.js", "background.js"]},
             "experiment_apis": {"ipSync": {"schema": "schema.json", "parent": {
                 "scopes": ["addon_parent"], "paths": [["ipSync"]], "script": "api.js"
@@ -35,7 +42,7 @@ impl IpSync {
             {"name": "confirm", "type": "function", "async": true, "parameters": [{"name": "ip", "type": "string"}]},
             {"name": "fail", "type": "function", "async": true, "parameters": [{"name": "message", "type": "string"}]}
         ]}]);
-        let settings = json!({"endpoint": endpoint});
+        let settings = json!({"endpoints": endpoints});
         let native_settings = json!({"token": token, "statePath": state_path, "tmpPath": state_tmp, "proxyPrefs": proxy_prefs});
         let files = [
             ("manifest.json", serde_json::to_string(&manifest)?),
@@ -122,7 +129,7 @@ mod tests {
     #[test]
     fn synchronization_rejects_stale_sessions_bad_ips_and_lost_heartbeat() {
         let home = tempfile::tempdir().unwrap();
-        let mut sync = IpSync::prepare(home.path(), "https://api.ipify.org?format=json", &Value::Null).unwrap();
+        let mut sync = IpSync::prepare(home.path(), &["https://api.ipify.org?format=json".to_string()], &Value::Null).unwrap();
         let state = |sync: &IpSync, ip: &str, token: &str, sequence: u64, error: &str| {
             fs::write(&sync.state_path, json!({"token": token, "sequence": sequence, "ip": ip, "error": error}).to_string()).unwrap();
         };

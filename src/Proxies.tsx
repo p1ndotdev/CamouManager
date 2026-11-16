@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useId, useCallback } from 'react';
+import React, { useState, useMemo, useId, useCallback, useEffect } from 'react';
 import type { PageProps, Proxy, ProxyCheck } from './types';
 import { openPath, request } from './api';
 import {
@@ -21,6 +21,24 @@ export default function Proxies({ snapshot, onRefresh, onMessage }: PageProps) {
   const [checkingAll, setCheckingAll] = useState(false);
   const [checkingId, setCheckingId] = useState<string | null>(null);
   const [updatingSetting, setUpdatingSetting] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [bulkDeleteOpen, setBulkDeleteOpen] = useState(false);
+  const [bulkDeleting, setBulkDeleting] = useState(false);
+
+  // Keep selection in sync when proxies are deleted or replaced by a refresh.
+  useEffect(() => {
+    const valid = new Set((snapshot.proxies || []).map((px) => px.id));
+    setSelectedIds((prev) => {
+      let stale = false;
+      for (const id of prev) {
+        if (!valid.has(id)) {
+          stale = true;
+          break;
+        }
+      }
+      return stale ? new Set([...prev].filter((id) => valid.has(id))) : prev;
+    });
+  }, [snapshot.proxies]);
 
   // Map of profile usage count per proxy id
   const usageMap = useMemo(() => {
@@ -155,6 +173,59 @@ export default function Proxies({ snapshot, onRefresh, onMessage }: PageProps) {
     }
   }, [deleteProxyId, onRefresh, onMessage, t]);
 
+  const toggleProxySelection = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const allFilteredSelected = filteredProxies.length > 0 && filteredProxies.every((px) => selectedIds.has(px.id));
+  const toggleSelectAllFiltered = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allFilteredSelected) filteredProxies.forEach((px) => next.delete(px.id));
+      else filteredProxies.forEach((px) => next.add(px.id));
+      return next;
+    });
+  };
+
+  const handleBulkDelete = useCallback(async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0) return;
+    setBulkDeleting(true);
+    try {
+      const res = await request<{ deleted: number; errors: { id: string; message: string }[] }>('proxy.delete_many', { ids });
+      setBulkDeleteOpen(false);
+      setSelectedIds(new Set());
+      await onRefresh();
+      if (res.errors.length === 0) {
+        onMessage(t(`Đã xóa ${res.deleted} proxy.`, `Deleted ${res.deleted} prox${res.deleted === 1 ? 'y' : 'ies'}.`), 'info');
+      } else {
+        const detail = res.errors.slice(0, 3).map((row) => row.message).join('; ');
+        onMessage(
+          t(
+            `Đã xóa ${res.deleted} proxy, ${res.errors.length} proxy không xóa được: ${detail}`,
+            `Deleted ${res.deleted}, ${res.errors.length} failed: ${detail}`
+          ),
+          'warning'
+        );
+      }
+    } catch (err: unknown) {
+      onMessage(
+        t(
+          `Lỗi xóa proxy hàng loạt: ${err instanceof Error ? err.message : String(err)}`,
+          `Failed to delete proxies: ${err instanceof Error ? err.message : String(err)}`
+        ),
+        'error'
+      );
+    } finally {
+      setBulkDeleting(false);
+    }
+  }, [onMessage, onRefresh, selectedIds, t]);
+
   // Save default proxy id setting
   const handleSaveDefaultProxy = useCallback(
     async (defId: string) => {
@@ -234,6 +305,21 @@ export default function Proxies({ snapshot, onRefresh, onMessage }: PageProps) {
   // VirtualTable Columns
   const columns: Column<Proxy>[] = useMemo(
     () => [
+      {
+        key: 'select',
+        header: t('Chọn', 'Select'),
+        width: 52,
+        align: 'center',
+        render: (px) => (
+          <input
+            type="checkbox"
+            aria-label={t(`Chọn proxy ${px.name || px.server}`, `Select proxy ${px.name || px.server}`)}
+            checked={selectedIds.has(px.id)}
+            onChange={() => toggleProxySelection(px.id)}
+            onClick={(e) => e.stopPropagation()}
+          />
+        ),
+      },
       {
         key: 'name',
         header: t('Tên proxy', 'Proxy Name'),
@@ -353,7 +439,7 @@ export default function Proxies({ snapshot, onRefresh, onMessage }: PageProps) {
         ),
       },
     ],
-    [usageMap, checkingId, handleCheckSingle, handleToggleEnabled, t]
+    [usageMap, checkingId, handleCheckSingle, handleToggleEnabled, selectedIds, toggleProxySelection, t]
   );
 
   const totalProxies = (snapshot.proxies || []).length;
@@ -379,6 +465,16 @@ export default function Proxies({ snapshot, onRefresh, onMessage }: PageProps) {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
+          <Button variant="secondary" onClick={toggleSelectAllFiltered} disabled={filteredProxies.length === 0}>
+            {allFilteredSelected ? t('Bỏ chọn tất cả', 'Deselect All') : t('Chọn tất cả', 'Select All')}
+          </Button>
+          <Button
+            variant="danger"
+            disabled={selectedIds.size === 0}
+            onClick={() => setBulkDeleteOpen(true)}
+          >
+            {t(`Xóa đã chọn (${selectedIds.size})`, `Delete selected (${selectedIds.size})`)}
+          </Button>
           <Button variant="secondary" onClick={() => setImportOpen(true)}>
             {t('Nhập danh sách', 'Bulk Import')}
           </Button>
@@ -465,6 +561,7 @@ export default function Proxies({ snapshot, onRefresh, onMessage }: PageProps) {
             columns={columns}
             rowHeight={44}
             rowKey="id"
+            selectedKeys={selectedIds}
           />
         )}
       </div>
@@ -507,6 +604,21 @@ export default function Proxies({ snapshot, onRefresh, onMessage }: PageProps) {
         variant="danger"
         onConfirm={handleConfirmDelete}
         onCancel={() => setDeleteProxyId(null)}
+      />
+
+      <ConfirmDialog
+        open={bulkDeleteOpen}
+        title={t('Xóa nhiều proxy', 'Delete Multiple Proxies')}
+        message={t(
+          `Xóa ${selectedIds.size} proxy đã chọn khỏi kho? Các profile đang gán những proxy này sẽ tự động chuyển sang kết nối trực tiếp. Proxy đang được profile chạy sử dụng sẽ bị bỏ qua.`,
+          `Delete ${selectedIds.size} selected prox${selectedIds.size === 1 ? 'y' : 'ies'} from the pool? Profiles using them switch to a direct connection. Proxies used by running profiles are skipped.`
+        )}
+        confirmText={t('Xóa proxy đã chọn', 'Delete selected proxies')}
+        cancelText={t('Hủy bỏ', 'Cancel')}
+        variant="danger"
+        loading={bulkDeleting}
+        onConfirm={handleBulkDelete}
+        onCancel={() => setBulkDeleteOpen(false)}
       />
     </div>
   );

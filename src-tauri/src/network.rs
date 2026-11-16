@@ -537,11 +537,37 @@ impl Network {
 
         let _guard = self.store.operation.lock();
         let all_profiles = self.store.list("profiles")?;
+        // Import never adds a second proxy with the same server + credentials; updates by id are still allowed.
+        let mut known_endpoints: Vec<((String, String, String), String)> = self
+            .store
+            .list("proxies")?
+            .iter()
+            .map(|px| {
+                (
+                    (string(px, "server").to_owned(), string(px, "username").to_owned(), string(px, "password").to_owned()),
+                    string(px, "id").to_owned(),
+                )
+            })
+            .collect();
         let mut warnings = Vec::new();
+        let mut batch_endpoints: std::collections::HashSet<(String, String, String)> = std::collections::HashSet::new();
         let mut records = Vec::with_capacity(parsed_items.len());
         let mut assignments = Vec::with_capacity(parsed_items.len());
         for (item, mut assign_profiles) in parsed_items {
             let resolved = self.resolve_proxy(&item)?;
+            let endpoint = (
+                string(&resolved, "server").to_owned(),
+                string(&resolved, "username").to_owned(),
+                string(&resolved, "password").to_owned(),
+            );
+            let resolved_id = string(&resolved, "id").to_owned();
+            let duplicates_existing = known_endpoints.iter().any(|(known, owner)| {
+                known == &endpoint && (resolved_id.is_empty() || owner != &resolved_id)
+            });
+            if duplicates_existing || !batch_endpoints.insert(endpoint.clone()) {
+                warnings.push(format!("Bỏ qua proxy trùng: {}", endpoint.0));
+                continue;
+            }
             if let Some(profs) = profiles {
                 // Same rule as proxy.save: never change a proxy a running browser is using.
                 let in_use = all_profiles.iter().any(|p| {
@@ -559,6 +585,7 @@ impl Network {
             }
             records.push(resolved);
             assignments.push(assign_profiles);
+            known_endpoints.push((endpoint, resolved_id));
         }
         let imported = self.store.put_many("proxies", records)?;
         if let Some(profs) = profiles {
@@ -1147,6 +1174,32 @@ mod tests {
         assert_eq!(to_proxy_url(&cleared).unwrap(), to_proxy_url(&saved_clear).unwrap());
 
     }
+    #[test]
+    fn import_skips_duplicate_server_and_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = crate::backend::Backend::open(root.path().to_owned()).unwrap();
+        let (rows, warnings) = backend
+            .network
+            .import_content(
+                "socks5://u:p@127.0.0.1:1080\nsocks5://u:p@127.0.0.1:1080\nsocks5://u:p@127.0.0.1:1081",
+                false,
+                None,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(backend.store.list("proxies").unwrap().len(), 2);
+
+        // Same endpoint again (pasted twice or a later import) adds nothing.
+        let (rows, warnings) = backend
+            .network
+            .import_content("socks5://u:p@127.0.0.1:1080", false, None)
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(backend.store.list("proxies").unwrap().len(), 2);
+    }
+
     #[test]
     fn egress_probe_falls_back_to_next_endpoint_and_accepts_ipv6() {
         use std::{io::{BufRead, BufReader, Write}, net::TcpListener};

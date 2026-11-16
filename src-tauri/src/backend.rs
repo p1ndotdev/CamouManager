@@ -154,7 +154,13 @@ impl Backend {
                 self.check_proxy_closed(string(&data,"id"))?;
                 self.network.save(data).map(|p| summary(&p))
             },
-            "proxy.import" => self.network.import_content(require_str(&params,"text")?,false,Some(&self.profiles)).map(|(p, _)| json!(p.iter().map(summary).collect::<Vec<_>>())),
+            "proxy.import" => {
+                let (rows, warnings) = self.network.import_content(require_str(&params,"text")?,false,Some(&self.profiles))?;
+                if let (Some(app), false) = (app, warnings.is_empty()) {
+                    let _ = app.emit("app:notice", json!({"level": "warning", "message": warnings.join("; ")}));
+                }
+                Ok(json!(rows.iter().map(summary).collect::<Vec<_>>()))
+            },
             "proxy.import_file" => {
                 let p = string(&params,"path").trim().to_owned();
                 let target = if p.is_empty() { self.store.root.join("proxy.config") } else { PathBuf::from(p) };
@@ -167,6 +173,17 @@ impl Backend {
             "proxy.delete" => {
                 let _lock = self.store.operation.lock(); self.check_proxy_closed(id()?)?;
                 self.network.delete(id()?, &self.profiles)?; Ok(Value::Null)
+            },
+            "proxy.delete_many" => {
+                let mut deleted = 0usize;
+                let mut errors = Vec::new();
+                for proxy_id in ids()? {
+                    match self.network.delete(&proxy_id, &self.profiles) {
+                        Ok(()) => deleted += 1,
+                        Err(error) => errors.push(json!({"id": proxy_id, "message": crate::store::redact(&format!("{error:#}"))})),
+                    }
+                }
+                Ok(json!({"deleted": deleted, "errors": errors}))
             },
             "proxy.check" => {
                 let proxy = if params["proxy"].is_object() { params["proxy"].clone() } else { self.store.get("proxies",id()?)?.ok_or_else(|| anyhow!("Proxy không tồn tại"))? };
@@ -204,7 +221,7 @@ impl Backend {
             if let Some(app) = app {
                 let resources: &[&str] = match method {
                     "backup.restore" => &["profiles","proxies","backups"],
-                    "proxy.delete" => &["proxies","profiles","settings"],
+                    "proxy.delete"|"proxy.delete_many" => &["proxies","profiles","settings"],
                     "proxy.save"|"proxy.import"|"proxy.import_file"|"proxy.check"|"proxy.check_all" => &["proxies","profiles"],
                     "settings.save"|"app.update" => &["settings"],
                     "versions.install"|"versions.delete"|"versions.check_updates" => &["versions","profiles"],

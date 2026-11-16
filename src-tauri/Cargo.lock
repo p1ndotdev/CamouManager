@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "camoumanager"
-version = "1.0.14"
+version = "1.0.15"
 dependencies = [
  "aead",
  "aes-gcm",
